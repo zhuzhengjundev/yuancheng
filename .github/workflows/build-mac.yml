@@ -1,0 +1,54 @@
+name: Build Mac DMG
+
+on:
+  # 手动触发（在 GitHub 仓库 Actions 页面点 Run workflow）
+  workflow_dispatch:
+  # 推送 tag 时自动触发（如 v1.0.0）
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-mac:
+    runs-on: macos-13
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: yarn install --ignore-engines --network-timeout 300000
+
+      - name: Build Mac DMG (x64 + arm64)
+        run: npx electron-builder --mac
+        env:
+          # 跳过代码签名（没有 Apple Developer 证书）
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          # 使用淘宝镜像加速下载
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+
+      - name: Upload DMG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteControl-Mac-DMG
+          path: |
+            dist/*.dmg
+            dist/*.blockmap
+          retention-days: 30
+
+      # 可选：推送 tag 时自动创建 Release
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.blockmap
+          draft: true
+          name: ${{ github.ref_name }}
+          generate_release_notes: true

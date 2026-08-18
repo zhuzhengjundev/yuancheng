@@ -1,0 +1,70 @@
+{
+  "name": "remote-control",
+  "version": "1.0.0",
+  "description": "Electron远程控制程序 - 仿ToDesk基本功能",
+  "main": "main.js",
+  "scripts": {
+    "start": "concurrently \"node server.js\" \"electron .\"",
+    "server": "node server.js",
+    "app": "electron .",
+    "build": "electron-builder --win",
+    "build:mac": "electron-builder --mac"
+  },
+  "keywords": ["electron", "remote-desktop", "remote-control"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "concurrently": "^8.2.2",
+    "electron-builder": "^24.6.4"
+  },
+  "build": {
+    "appId": "com.remotecontrol.app",
+    "productName": "RemoteControl",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "win-robot.js",
+      "index.html",
+      "control.html",
+      "incoming.html",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "RemoteControl"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "title": "RemoteControl Installer",
+      "contents": [
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
+    }
+  }
+}
