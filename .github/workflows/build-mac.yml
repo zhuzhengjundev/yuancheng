@@ -12,6 +12,13 @@ permissions:
 jobs:
   build-mac:
     runs-on: macos-14
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}/.electron-cache
+      GH_TOKEN: ${{ github.token }}
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+      ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+      ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,6 +27,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: yarn
 
       - name: Install dependencies
         run: yarn install --ignore-engines --network-timeout 300000
@@ -28,12 +36,7 @@ jobs:
         run: rm -rf dist
 
       - name: Build DMG (arm64 + x64)
-        run: npx electron-builder --mac
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-          GH_TOKEN: ${{ github.token }}
-          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
-          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+        run: npx electron-builder --mac --publish never
 
       - name: List build output
         run: ls -la dist/

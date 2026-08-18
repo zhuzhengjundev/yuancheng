@@ -1,47 +1,58 @@
 /**
- * Electron 主进程 - P2P 直连版
- * 无需独立信令服务器，两个客户端直接互连
- * 每个客户端既监听端口又主动连接对方公网 IP
+ * Electron 主进程 - 公共服务器 + 设备代码/密码模式
+ *
+ * 工作模式：
+ *   - 客户端启动即连接公共中继服务器（WS）
+ *   - 服务器下发 9 位设备代码 + 6 位密码（显示在 UI 上）
+ *   - 用户输入对方设备代码 + 密码 → 向服务器发起 connect-device
+ *   - 服务端验证后建立 session，之后所有消息（屏幕帧 / 键鼠 / 剪贴板）
+ *     均通过 to-peer / from-peer 进行转发
+ *   - 主控端：打开控制窗口，接收屏幕帧、发送键鼠命令
+ *   - 被控端：开始推屏幕，收到命令后通过 win-robot 执行
  */
 
 const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard } = require('electron');
 const path = require('path');
-const WebSocket = require('ws');
-const WebSocketServer = WebSocket.Server;
-const crypto = require('crypto');
 const os = require('os');
+const WebSocket = require('ws');
 
-// ============ P2P 配置 ============
-const P2P_PORT = 3001;
-// 两个公网 IP（程序会自动判断本机是哪个，然后连另一个）
-const PEER_IPS = ['27.115.22.146', '58.210.4.122'];
-
-// 本机唯一标识（用于握手时区分"连到自己"还是"连到对方"）
-const MY_ID = crypto.randomUUID();
+// ============ 服务器地址 ============
+// 优先环境变量，否则使用用户指定的公共服务器
+const SERVER_URLS = [
+  process.env.RELAY_URL,
+  'ws://172.21.22.244:3001',
+  'ws://127.0.0.1:3001',
+  'ws://localhost:3001'
+].filter(Boolean);
 
 // ============ 全局状态 ============
 let mainWindow = null;
-let controlWindow = null;
+let controlWindow = null;  // 主控端窗口（显示对方桌面）
 
-// P2P 连接
-let p2pSocket = null;        // 与对方的 WebSocket 连接
-let p2pConnected = false;
-let connectTimer = null;     // 定时重试连接
-let wsServer = null;          // 本机 WebSocket Server
+let ws = null;
+let serverConnected = false;
+let reconnectTimer = null;
+let serverUrlIndex = 0;
+
+// 本机信息
+let myDeviceCode = '';
+let myPassword = '';
+let myClientId = '';
+
+// 会话
+let sessionId = null;
+let myRole = null;       // 'controller' | 'controlled'
+let peerCode = null;
 
 // 屏幕捕获
 let captureTimer = null;
 const CAPTURE_INTERVAL = 150;
 
-// 是否正在向对方发送屏幕
-let isSendingScreen = false;
-
-// ============ 窗口管理 ============
-
+// ==================== 窗口 ====================
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 480,
-    height: 520,
+    height: 820,
     resizable: false,
     maximizable: false,
     title: '远程控制',
@@ -65,7 +76,6 @@ function createControlWindow() {
     controlWindow.focus();
     return;
   }
-
   controlWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -78,292 +88,281 @@ function createControlWindow() {
       nodeIntegration: false
     }
   });
-
   controlWindow.setMenuBarVisibility(false);
   controlWindow.loadFile('control.html');
-
   controlWindow.on('closed', () => {
-    // 通知对方停止发送屏幕
-    sendP2P({ type: 'screen-stop' });
+    // 主控关闭窗口 -> 结束会话
+    if (myRole === 'controller') {
+      sendToServer({ type: 'disconnect' });
+      stopScreenCapture();
+    }
     controlWindow = null;
   });
 }
 
-// ============ P2P 网络层 ============
+// ==================== 服务器连接 ====================
+function connectServer() {
+  if (serverConnected) return;
+  if (serverUrlIndex >= SERVER_URLS.length) {
+    serverUrlIndex = 0;
+    scheduleReconnect(4000);
+    return;
+  }
+  const url = SERVER_URLS[serverUrlIndex];
+  console.log('[WS] 尝试连接:', url, `${serverUrlIndex + 1}/${SERVER_URLS.length}`);
 
-function sendP2P(data) {
-  if (p2pSocket && p2pConnected && p2pSocket.readyState === WebSocket.OPEN) {
-    p2pSocket.send(JSON.stringify(data));
+  let sock;
+  try {
+    sock = new WebSocket(url, { timeout: 5000 });
+  } catch (e) {
+    serverUrlIndex++;
+    scheduleReconnect(500);
+    return;
+  }
+
+  let opened = false;
+  const failTimer = setTimeout(() => {
+    if (!opened) try { sock.terminate(); } catch (e) {}
+  }, 5500);
+
+  sock.on('open', () => {
+    opened = true;
+    clearTimeout(failTimer);
+    serverUrlIndex = 0;
+    ws = sock;
+    serverConnected = true;
+    console.log('[WS] 已连接服务器');
+    notifyMainStatus();
+  });
+
+  sock.on('message', (raw) => {
+    let data;
+    try { data = JSON.parse(raw.toString()); } catch (e) { return; }
+    handleServerMessage(data);
+  });
+
+  sock.on('error', () => {
+    clearTimeout(failTimer);
+    if (!opened) {
+      serverUrlIndex++;
+      scheduleReconnect(500);
+    }
+  });
+
+  sock.on('close', () => {
+    clearTimeout(failTimer);
+    console.log('[WS] 与服务器断开');
+    serverConnected = false;
+    ws = null;
+    // 会话级清理
+    if (sessionId) {
+      cleanupSession(true);
+    }
+    notifyMainStatus();
+    if (!opened) {
+      serverUrlIndex++;
+      scheduleReconnect(500);
+    } else {
+      scheduleReconnect(3000);
+    }
+  });
+}
+
+function scheduleReconnect(delay = 3000) {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectServer();
+  }, delay);
+}
+
+function sendToServer(data) {
+  if (ws && serverConnected && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
     return true;
   }
   return false;
 }
 
-function notifyStatus() {
-  if (mainWindow) {
-    mainWindow.webContents.send('p2p-status', { connected: p2pConnected });
-  }
+// 向对端发送（走服务器转发）
+function sendToPeer(payload) {
+  if (!sessionId) return false;
+  return sendToServer({ type: 'to-peer', payload });
 }
 
-// 启动 WebSocket Server（接收入站连接）
-function startWsServer() {
-  try {
-    wsServer = new WebSocketServer({ port: P2P_PORT });
-    console.log(`[P2P] WebSocket Server 监听端口 ${P2P_PORT}`);
-
-    wsServer.on('connection', (ws, req) => {
-      console.log('[P2P] 收到入站连接:', req.socket.remoteAddress);
-      handlePeerConnection(ws, 'incoming');
-    });
-
-    wsServer.on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        console.error(`[P2P] 端口 ${P2P_PORT} 被占用，请先释放`);
-      } else {
-        console.error('[P2P] Server错误:', err.message);
-      }
-    });
-  } catch (e) {
-    console.error('[P2P] 启动Server失败:', e.message);
-  }
-}
-
-// 主动连接对方公网 IP
-function startConnectingPeers() {
-  if (connectTimer) return;
-
-  const tryConnectAll = () => {
-    if (p2pConnected) return; // 已连接，停止重试
-
-    for (const ip of PEER_IPS) {
-      tryConnectPeer(ip);
-    }
-  };
-
-  // 立即尝试一次
-  tryConnectAll();
-  // 定时重试
-  connectTimer = setInterval(tryConnectAll, 5000);
-}
-
-function tryConnectPeer(ip) {
-  if (p2pConnected) return;
-
-  const url = `ws://${ip}:${P2P_PORT}`;
-  let ws;
-
-  try {
-    ws = new WebSocket(url, { timeout: 3000 });
-  } catch (e) {
-    return;
-  }
-
-  const timeoutTimer = setTimeout(() => {
-    if (ws.readyState === WebSocket.CONNECTING) {
-      try { ws.terminate(); } catch (e) {}
-    }
-  }, 4000);
-
-  ws.on('open', () => {
-    clearTimeout(timeoutTimer);
-    console.log('[P2P] 连接成功:', url);
-    // 发送握手
-    ws.send(JSON.stringify({ type: 'hello', id: MY_ID }));
-  });
-
-  ws.on('message', (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch (e) { return; }
-
-    // 握手应答
-    if (data.type === 'hello-ack') {
-      if (data.id === MY_ID) {
-        // 连到了自己，断开
-        console.log('[P2P] 连到了自己，断开');
-        try { ws.close(); } catch (e) {}
-        return;
-      }
-      // 连到了对方
-      handlePeerConnection(ws, 'outgoing');
-    }
-  });
-
-  ws.on('error', () => {
-    clearTimeout(timeoutTimer);
-  });
-
-  ws.on('close', () => {
-    clearTimeout(timeoutTimer);
-  });
-}
-
-// 处理与对方的连接（入站或出站）
-function handlePeerConnection(ws, direction) {
-  // 如果已经连接了，关闭新连接
-  if (p2pConnected) {
-    try { ws.close(); } catch (e) {}
-    return;
-  }
-
-  // 入站连接需要等待对方的 hello 消息
-  if (direction === 'incoming') {
-    let helloReceived = false;
-    const helloTimeout = setTimeout(() => {
-      if (!helloReceived) {
-        try { ws.close(); } catch (e) {}
-      }
-    }, 5000);
-
-    ws.once('message', (msg) => {
-      clearTimeout(helloTimeout);
-      helloReceived = true;
-      let data;
-      try {
-        data = JSON.parse(msg.toString());
-      } catch (e) { return; }
-
-      if (data.type === 'hello') {
-        if (data.id === MY_ID) {
-          // 连到了自己
-          console.log('[P2P] 入站连接是自己，断开');
-          try { ws.close(); } catch (e) {}
-          return;
-        }
-        // 连到了对方，回复握手
-        ws.send(JSON.stringify({ type: 'hello-ack', id: MY_ID }));
-        establishP2P(ws);
-      }
-    });
-  }
-  // 出站连接的握手在 tryConnectPeer 中处理
-  // hello-ack 确认后调用 establishP2P
-}
-
-// P2P 连接正式建立
-function establishP2P(ws) {
-  if (p2pConnected) {
-    try { ws.close(); } catch (e) {}
-    return;
-  }
-
-  p2pSocket = ws;
-  p2pConnected = true;
-  console.log('[P2P] 与对方建立连接');
-
-  // 停止重试
-  if (connectTimer) {
-    clearInterval(connectTimer);
-    connectTimer = null;
-  }
-
-  // 通知前端
-  notifyStatus();
-
-  // 自动打开控制窗口
-  if (!controlWindow) {
-    createControlWindow();
-  }
-
-  // 开始屏幕捕获，发送给对方
-  startScreenCapture();
-
-  // 处理对方消息
-  ws.on('message', (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch (e) { return; }
-    handleP2PMessage(data);
-  });
-
-  ws.on('close', () => {
-    onP2PDisconnected();
-  });
-
-  ws.on('error', () => {
-    onP2PDisconnected();
-  });
-}
-
-function onP2PDisconnected() {
-  console.log('[P2P] 连接断开');
-  p2pSocket = null;
-  p2pConnected = false;
-  stopScreenCapture();
-
-  if (mainWindow) {
-    mainWindow.webContents.send('p2p-status', { connected: false });
-  }
-  if (controlWindow) {
-    controlWindow.webContents.send('session-ended');
-  }
-
-  // 恢复重试连接
-  startConnectingPeers();
-}
-
-// ============ P2P 消息处理 ============
-
-function handleP2PMessage(data) {
+// ==================== 服务端消息处理 ====================
+function handleServerMessage(data) {
   switch (data.type) {
-    // 收到对方屏幕帧
-    case 'screen-frame':
-      if (controlWindow) {
-        controlWindow.webContents.send('screen-frame', {
-          image: data.image,
-          width: data.width,
-          height: data.height
+    case 'device-info': {
+      // 本机设备代码 + 密码（首次分配或刷新密码后）
+      myDeviceCode = data.deviceCode || '';
+      myPassword = data.password || '';
+      myClientId = data.clientId || myClientId;
+      console.log(`[APP] 本机: 设备代码=${formatCode(myDeviceCode)}  密码=${myPassword}`);
+
+      // 向服务器上报 hostname（便于管理面板识别设备名）
+      const hostName = os.hostname();
+      sendToServer({ type: 'register-device-name', hostname: hostName });
+
+      notifyDeviceInfo();
+      notifyMainStatus();
+      break;
+    }
+
+    case 'ping': {
+      sendToServer({ type: 'pong' });
+      break;
+    }
+
+    case 'connect-error': {
+      if (mainWindow) {
+        mainWindow.webContents.send('connect-error', data.message || '连接失败');
+      }
+      break;
+    }
+
+    case 'connected': {
+      // 主控端 -> 会话建立（我是 controller，开始打开 control window，让对方推屏幕）
+      sessionId = data.sessionId;
+      myRole = data.role;
+      peerCode = data.peerCode;
+      console.log(`[APP] 会话建立，我是主控，对方=${formatCode(peerCode)}`);
+
+      if (!controlWindow) createControlWindow();
+
+      // 请求被控端开始推屏
+      sendToPeer({ type: 'screen-start' });
+
+      notifyMainStatus();
+      if (mainWindow) {
+        mainWindow.webContents.send('connect-ok', {
+          role: myRole,
+          peerCode,
+          sessionId
         });
       }
       break;
+    }
 
-    // 对方停止发送屏幕
-    case 'screen-stop':
-      // 对方关闭了控制窗口，但我们还保持连接
+    case 'incoming-control': {
+      // 被控端 -> 有人控制我
+      sessionId = data.sessionId;
+      myRole = data.role;
+      peerCode = data.peerCode;
+      console.log(`[APP] 被控制请求，来自=${formatCode(peerCode)}`);
+
+      // 自动接受并开始推屏
+      startScreenCapture();
+      sendToServer({ type: 'accept-control' });
+
+      notifyMainStatus();
+      if (mainWindow) {
+        mainWindow.webContents.send('incoming-control', {
+          role: myRole,
+          peerCode,
+          sessionId
+        });
+      }
       break;
+    }
 
-    // 收到键鼠命令
-    case 'remote-command':
-      handleRemoteCommand(data.command, data.params);
+    case 'session-ended': {
+      console.log('[APP] 会话结束');
+      cleanupSession(false);
+      notifyMainStatus();
       break;
+    }
 
-    // 剪贴板同步
-    case 'clipboard-sync':
-      try {
-        if (data.content !== clipboard.readText()) {
-          clipboard.writeText(data.content);
-        }
-      } catch (e) {}
+    case 'from-peer': {
+      handlePeerMessage(data.payload, data.fromRole);
       break;
+    }
 
-    // 获取剪贴板
-    case 'get-clipboard':
-      const content = clipboard.readText();
-      sendP2P({ type: 'clipboard-result', content });
-      break;
-
-    // 剪贴板结果
-    case 'clipboard-result':
-      try { clipboard.writeText(data.content); } catch (e) {}
+    case 'error':
+      console.error('[WS] 服务端错误:', data.message);
       break;
   }
 }
 
-// ============ 屏幕捕获 ============
+function cleanupSession(disconnected) {
+  stopScreenCapture();
+  if (controlWindow) {
+    controlWindow.webContents.send('session-ended');
+    // 主控端关闭窗口；被控端不关闭（它可能没打开）
+    if (myRole === 'controller') {
+      try { controlWindow.close(); } catch (e) {}
+    }
+    controlWindow = null;
+  }
+  sessionId = null;
+  myRole = null;
+  peerCode = null;
+  notifyMainStatus();
+}
 
+// ==================== 对端消息处理 ====================
+function handlePeerMessage(payload, fromRole) {
+  if (!payload || typeof payload !== 'object') return;
+  switch (payload.type) {
+    case 'screen-start': {
+      // 主控让我（被控）开始推屏
+      if (myRole === 'controlled') {
+        startScreenCapture();
+      }
+      break;
+    }
+    case 'screen-stop': {
+      stopScreenCapture();
+      break;
+    }
+    case 'screen-frame': {
+      // 推给控制窗口渲染
+      if (controlWindow && myRole === 'controller') {
+        controlWindow.webContents.send('screen-frame', {
+          image: payload.image,
+          width: payload.width,
+          height: payload.height
+        });
+      }
+      break;
+    }
+    case 'remote-command': {
+      // 来自主控的键鼠命令 —— 只有被控执行
+      if (myRole === 'controlled') {
+        handleRemoteCommand(payload.command, payload.params || {});
+      }
+      break;
+    }
+    case 'clipboard-sync': {
+      try {
+        if (payload.content !== clipboard.readText()) {
+          clipboard.writeText(payload.content);
+        }
+      } catch (e) {}
+      break;
+    }
+    case 'get-clipboard': {
+      const content = clipboard.readText();
+      sendToPeer({ type: 'clipboard-result', content });
+      break;
+    }
+    case 'clipboard-result': {
+      try { clipboard.writeText(payload.content); } catch (e) {}
+      break;
+    }
+  }
+}
+
+// ==================== 屏幕捕获（被控端推流） ====================
 function startScreenCapture() {
   if (captureTimer) return;
-  isSendingScreen = true;
-  console.log('[P2P] 开始屏幕捕获');
+  console.log('[Capture] 开始屏幕捕获');
 
   const captureOnce = async () => {
-    if (!isSendingScreen || !p2pConnected) {
+    if (!sessionId || myRole !== 'controlled') {
       stopScreenCapture();
       return;
     }
-
     try {
       const primaryDisplay = screen.getPrimaryDisplay();
       const { width, height } = primaryDisplay.workAreaSize;
@@ -377,18 +376,17 @@ function startScreenCapture() {
       });
 
       if (sources.length > 0) {
-        const thumbnail = sources[0].thumbnail;
-        const imageData = thumbnail.toJPEG(65);
-
-        sendP2P({
+        const thumb = sources[0].thumbnail;
+        const jpeg = thumb.toJPEG(65);
+        sendToPeer({
           type: 'screen-frame',
-          image: imageData.toString('base64'),
-          width: thumbnail.getWidth(),
-          height: thumbnail.getHeight()
+          image: jpeg.toString('base64'),
+          width: thumb.getWidth(),
+          height: thumb.getHeight()
         });
       }
     } catch (e) {
-      console.error('[P2P] 屏幕捕获错误:', e.message);
+      console.error('[Capture] 错误:', e.message);
     }
   };
 
@@ -401,26 +399,23 @@ function stopScreenCapture() {
     clearInterval(captureTimer);
     captureTimer = null;
   }
-  isSendingScreen = false;
 }
 
-// ============ 键鼠控制 ============
-
+// ==================== 键鼠控制（被控端执行） ====================
 let _winRobot = null;
 function getWinRobot() {
   if (_winRobot) return _winRobot;
   try {
     _winRobot = require('./win-robot');
-    _winRobot.init().catch(e => console.warn('[P2P] WinRobot init err:', e.message));
+    _winRobot.init().catch(e => console.warn('[Robot] init err:', e.message));
   } catch (e) {
-    console.error('[P2P] WinRobot模块加载失败:', e.message);
+    console.error('[Robot] 加载失败:', e.message);
     _winRobot = null;
   }
   return _winRobot;
 }
 
 async function handleRemoteCommand(command, params) {
-  // 剪贴板操作
   if (command === 'set-clipboard') {
     if (params.content != null) {
       try { clipboard.writeText(String(params.content)); } catch (e) {}
@@ -428,109 +423,109 @@ async function handleRemoteCommand(command, params) {
     return;
   }
   if (command === 'get-clipboard') {
-    try {
-      sendP2P({ type: 'clipboard-result', content: clipboard.readText() });
-    } catch (e) {}
+    try { sendToPeer({ type: 'clipboard-result', content: clipboard.readText() }); } catch (e) {}
     return;
   }
-
   const r = getWinRobot();
   if (!r) return;
-
   try {
     switch (command) {
-      case 'mouse-move':
-        await r.moveMouse(params.x || 0, params.y || 0);
-        break;
-      case 'mouse-click':
-        await r.mouseClick(params.x || 0, params.y || 0, params.button || 'left', !!params.double);
-        break;
-      case 'mouse-down':
-        await r.mouseDown(params.x || 0, params.y || 0, params.button || 'left');
-        break;
-      case 'mouse-up':
-        await r.mouseUp(params.button || 'left');
-        break;
-      case 'mouse-scroll':
-        await r.scrollMouse(params.dx || 0, params.dy || 0);
-        break;
-      case 'key-down':
-        if (params.key) await r.keyDown(params.key);
-        break;
-      case 'key-up':
-        if (params.key) await r.keyUp(params.key);
-        break;
-      case 'key-tap':
-        if (params.key) await r.keyTap(params.key, params.modifiers || []);
-        break;
-      case 'type-string':
-        if (params.string) await r.typeString(params.string);
-        break;
+      case 'mouse-move':   await r.moveMouse(params.x || 0, params.y || 0); break;
+      case 'mouse-click':  await r.mouseClick(params.x || 0, params.y || 0, params.button || 'left', !!params.double); break;
+      case 'mouse-down':   await r.mouseDown(params.x || 0, params.y || 0, params.button || 'left'); break;
+      case 'mouse-up':     await r.mouseUp(params.button || 'left'); break;
+      case 'mouse-scroll': await r.scrollMouse(params.dx || 0, params.dy || 0); break;
+      case 'key-down':     if (params.key) await r.keyDown(params.key); break;
+      case 'key-up':       if (params.key) await r.keyUp(params.key); break;
+      case 'key-tap':      if (params.key) await r.keyTap(params.key, params.modifiers || []); break;
+      case 'type-string':  if (params.string) await r.typeString(params.string); break;
     }
   } catch (e) {
-    console.error('[P2P] 命令执行失败:', command, e.message);
+    console.error('[Robot] 命令失败:', command, e.message);
   }
 }
 
-// ============ IPC 通信 ============
+// ==================== IPC 通信（渲染进程） ====================
+ipcMain.handle('get-device-info', () => ({
+  deviceCode: myDeviceCode,
+  password: myPassword,
+  serverConnected,
+  session: sessionId ? { role: myRole, peerCode } : null
+}));
 
-ipcMain.handle('get-p2p-status', () => {
-  return { connected: p2pConnected };
+ipcMain.handle('refresh-password', () => {
+  return sendToServer({ type: 'refresh-password' });
 });
 
-ipcMain.handle('send-command', (event, { command, params }) => {
-  if (!p2pConnected) return { success: false };
-  sendP2P({ type: 'remote-command', command, params });
-  return { success: true };
-});
-
-ipcMain.handle('sync-clipboard', (event, { content }) => {
-  try { clipboard.writeText(content); } catch (e) {}
-  sendP2P({ type: 'clipboard-sync', content });
-  return { success: true };
+ipcMain.handle('connect-device', (_e, { targetCode, targetPassword }) => {
+  return sendToServer({
+    type: 'connect-device',
+    targetCode: (targetCode || '').toString().replace(/\s/g, ''),
+    targetPassword: (targetPassword || '').toString()
+  });
 });
 
 ipcMain.handle('disconnect', () => {
-  if (p2pSocket) {
-    try { p2pSocket.close(); } catch (e) {}
-  }
+  sendToServer({ type: 'disconnect' });
+  cleanupSession(false);
+  return true;
+});
+
+// 从 control window 发出的键鼠命令（主控 -> 被控）
+ipcMain.handle('send-command', (_e, { command, params }) => {
+  if (!sessionId) return { success: false };
+  sendToPeer({ type: 'remote-command', command, params });
   return { success: true };
 });
 
-// ============ Electron 生命周期 ============
+ipcMain.handle('sync-clipboard', (_e, { content }) => {
+  try { clipboard.writeText(content); } catch (e) {}
+  sendToPeer({ type: 'clipboard-sync', content });
+  return { success: true };
+});
 
+// ==================== 状态通知 ====================
+function notifyDeviceInfo() {
+  if (mainWindow) {
+    mainWindow.webContents.send('device-info', {
+      deviceCode: myDeviceCode,
+      password: myPassword
+    });
+  }
+}
+
+function notifyMainStatus() {
+  if (mainWindow) {
+    mainWindow.webContents.send('app-status', {
+      serverConnected,
+      deviceCode: myDeviceCode,
+      password: myPassword,
+      session: sessionId ? { role: myRole, peerCode, sessionId } : null
+    });
+  }
+}
+
+function formatCode(code) {
+  if (!code || code.length !== 9) return code;
+  return code.slice(0, 3) + ' ' + code.slice(3, 6) + ' ' + code.slice(6);
+}
+
+// ==================== Electron 生命周期 ====================
 app.whenReady().then(() => {
-  // 初始化键鼠控制引擎
   getWinRobot();
-
   createMainWindow();
-
-  // 启动 P2P：监听 + 主动连接
-  startWsServer();
-  startConnectingPeers();
+  connectServer();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow();
-    }
+    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 });
 
 app.on('window-all-closed', () => {
   stopScreenCapture();
-  if (connectTimer) {
-    clearInterval(connectTimer);
-    connectTimer = null;
-  }
-  if (wsServer) {
-    try { wsServer.close(); } catch (e) {}
-  }
-  if (p2pSocket) {
-    try { p2pSocket.close(); } catch (e) {}
-  }
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.close(); } catch (e) {} }
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
