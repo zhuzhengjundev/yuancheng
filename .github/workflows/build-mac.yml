@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build-mac-arm64:
+  build-mac:
     runs-on: macos-14
     steps:
       - name: Checkout code
@@ -27,10 +27,23 @@ jobs:
       - name: Clean dist
         run: rm -rf dist
 
-      - name: Build arm64 DMG
-        run: npx electron-builder --mac --arm64
+      - name: Build DMG (arm64 + x64)
+        run: npx electron-builder --mac
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
           GH_TOKEN: ${{ github.token }}
           ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
           ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+
+      - name: List build output
+        run: ls -la dist/
+
+      - name: Upload DMG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteControl-Mac-DMG
+          path: |
+            dist/*.dmg
+            dist/*.blockmap
+          retention-days: 30
+          if-no-files-found: error
