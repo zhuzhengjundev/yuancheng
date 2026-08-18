@@ -7,7 +7,6 @@ on:
       - 'v*'
 
 jobs:
-  # Apple Silicon (M1/M2/M3) - macos-14 容量充足
   build-mac-arm64:
     runs-on: macos-14
     steps:
@@ -44,7 +43,6 @@ jobs:
             dist/*.blockmap
           retention-days: 30
 
-  # Intel Mac - macos-13 可能排队
   build-mac-x64:
     runs-on: macos-13
     steps:
@@ -81,7 +79,6 @@ jobs:
             dist/*.blockmap
           retention-days: 30
 
-  # 合并 Release（仅 tag 触发时）
   release:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
