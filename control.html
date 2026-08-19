@@ -124,7 +124,8 @@
     <div class="status-info">
       <span class="rec-dot"></span>
       <div class="status-text">远程桌面 - 对方屏幕</div>
-      <span class="fps" id="fpsDisplay">0 FPS</span>
+      <span class="fps" id="fpsDisplay">等待画面...</span>
+      <span class="fps" id="frameInfo" style="display:none;"></span>
     </div>
     <div class="toolbar-buttons">
       <button class="t-btn" id="btnFullscreen" title="全屏">
@@ -210,15 +211,44 @@
     }, 1000);
 
     // ====== 画面渲染 ======
+    let receivedFrameCount = 0;
+    let lastFrameTime = performance.now();
+    
     api.onScreenFrame(({ image, width, height }) => {
-      if (!image) return;
-      const screen = $('screen');
-      screen.src = 'data:image/jpeg;base64,' + image;
-      if (screen.classList.contains('hidden')) {
-        screen.classList.remove('hidden');
-        $('placeholder').classList.add('hidden');
+      if (!image) {
+        console.warn('[Control] 收到空帧');
+        return;
       }
-      frameCount++;
+      
+      receivedFrameCount++;
+      const now = performance.now();
+      
+      // 更新FPS和显示信息
+      if (receivedFrameCount === 1) {
+        $('fpsDisplay').textContent = '已连接';
+      }
+      
+      // 每5秒显示一次详细信息
+      if (now - lastFrameTime >= 5000) {
+        const imgSize = (image.length * 3 / 4 / 1024).toFixed(1);
+        console.log(`[Control] 帧统计: 收到${receivedFrameCount}帧, 当前帧: ${imgSize}KB, 分辨率: ${width}x${height}`);
+        $('frameInfo').textContent = `${width}x${height} | ${imgSize}KB`;
+        $('frameInfo').style.display = 'inline';
+        lastFrameTime = now;
+      }
+      
+      const screen = $('screen');
+      try {
+        screen.src = 'data:image/jpeg;base64,' + image;
+        if (screen.classList.contains('hidden')) {
+          screen.classList.remove('hidden');
+          $('placeholder').classList.add('hidden');
+          console.log('[Control] 画面已显示');
+        }
+        frameCount++;
+      } catch (err) {
+        console.error('[Control] 渲染帧失败:', err.message);
+      }
     });
 
     // ====== 鼠标事件 ======

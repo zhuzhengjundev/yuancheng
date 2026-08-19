@@ -15,9 +15,10 @@ const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard, systemP
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
-// ============ 配置文件（读写 WS 地址） ============
+// ============ 配置文件（读写 WS 地址、clientId 等） ============
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
 
 function loadConfig() {
@@ -46,6 +47,45 @@ function setSavedWsUrl(url) {
   cfg.wsUrl = url;
   saveConfig(cfg);
   console.log('[CFG] 已保存 WS 地址:', url);
+}
+
+// ============ 稳定 clientId 生成 ============
+// 基于 hostname + userData 路径生成稳定 ID，保证同一设备每次相同
+function generateStableClientId() {
+  const cfg = loadConfig();
+  if (cfg.stableClientId) {
+    return cfg.stableClientId;
+  }
+  // 首次生成：基于 hostname 和 app userData 路径生成
+  const seed = `${os.hostname()}|${app.getPath('userData')}`;
+  const hash = crypto.createHash('sha256').update(seed).digest('hex');
+  const id = hash.substring(0, 20);  // 20字符足够唯一
+  
+  // 保存到配置
+  cfg.stableClientId = id;
+  saveConfig(cfg);
+  console.log('[CFG] 生成并保存 stableClientId:', id);
+  return id;
+}
+
+function getStableClientId() {
+  return generateStableClientId();
+}
+
+// 保存服务器返回的设备代码和密码到本地（用于显示和记忆）
+function saveDeviceInfoLocal(deviceCode, password) {
+  const cfg = loadConfig();
+  cfg.deviceCode = deviceCode;
+  cfg.password = password;
+  saveConfig(cfg);
+}
+
+function getSavedDeviceInfo() {
+  const cfg = loadConfig();
+  return {
+    deviceCode: cfg.deviceCode || '',
+    password: cfg.password || ''
+  };
 }
 
 // ============ 服务器地址 ============
@@ -135,6 +175,16 @@ function createControlWindow() {
   });
   controlWindow.setMenuBarVisibility(false);
   controlWindow.loadFile('control.html');
+  
+  // 窗口加载完成后通知被控端开始推屏
+  controlWindow.webContents.once('did-finish-load', () => {
+    console.log('[Control] 控制窗口已加载完成，请求被控端开始推屏');
+    // 如果是主控端，请求被控端推屏
+    if (myRole === 'controller' && sessionId) {
+      sendToPeer({ type: 'screen-start' });
+    }
+  });
+  
   controlWindow.on('closed', () => {
     // 主控关闭窗口 -> 结束会话
     if (myRole === 'controller') {
@@ -153,8 +203,12 @@ function connectServer() {
     scheduleReconnect(4000);
     return;
   }
-  const url = SERVER_URLS[serverUrlIndex];
-  console.log('[WS] 尝试连接:', url, `${serverUrlIndex + 1}/${SERVER_URLS.length}`);
+  const baseUrl = SERVER_URLS[serverUrlIndex];
+  // 在 URL 后追加 clientId 参数
+  const stableClientId = getStableClientId();
+  const sep = baseUrl.includes('?') ? '&' : '?';
+  const url = `${baseUrl}${sep}clientId=${encodeURIComponent(stableClientId)}`;
+  console.log('[WS] 尝试连接:', baseUrl, '(clientId:', stableClientId + ')', `${serverUrlIndex + 1}/${SERVER_URLS.length}`);
 
   let sock;
   try {
@@ -249,6 +303,9 @@ function handleServerMessage(data) {
       myClientId = data.clientId || myClientId;
       console.log(`[APP] 本机: 设备代码=${formatCode(myDeviceCode)}  密码=${myPassword}`);
 
+      // 保存设备信息到本地配置
+      saveDeviceInfoLocal(myDeviceCode, myPassword);
+
       // 向服务器上报 hostname（便于管理面板识别设备名）
       const hostName = os.hostname();
       sendToServer({ type: 'register-device-name', hostname: hostName });
@@ -278,9 +335,9 @@ function handleServerMessage(data) {
       console.log(`[APP] 会话建立，我是主控，对方=${formatCode(peerCode)}`);
 
       if (!controlWindow) createControlWindow();
-
-      // 请求被控端开始推屏
-      sendToPeer({ type: 'screen-start' });
+      
+      // 注意：screen-start 将在控制窗口加载完成后发送（在 createControlWindow 的 did-finish-load 中）
+      // 这样可以确保控制窗口已经准备好接收屏幕帧
 
       notifyMainStatus();
       if (mainWindow) {
@@ -337,6 +394,8 @@ function cleanupSession(disconnected) {
   stopScreenCapture();
   captureFailCount = 0;
   captureWarningShown = false;
+  captureFrameCount = 0;
+  lastCaptureTime = 0;
   if (controlWindow) {
     controlWindow.webContents.send('session-ended');
     // 主控端关闭窗口；被控端不关闭（它可能没打开）
@@ -348,6 +407,7 @@ function cleanupSession(disconnected) {
   sessionId = null;
   myRole = null;
   peerCode = null;
+  console.log('[APP] 会话已清理, 原因:', disconnected ? '断开' : '正常结束');
   notifyMainStatus();
 }
 
@@ -369,11 +429,19 @@ function handlePeerMessage(payload, fromRole) {
     case 'screen-frame': {
       // 推给控制窗口渲染
       if (controlWindow && myRole === 'controller') {
+        const frameSize = payload.image ? (payload.image.length * 3 / 4 / 1024).toFixed(1) : 0;
         controlWindow.webContents.send('screen-frame', {
           image: payload.image,
           width: payload.width,
           height: payload.height
         });
+        // 每5秒打印一次接收状态
+        if (!handlePeerMessage._frameLogTime || Date.now() - handlePeerMessage._frameLogTime >= 5000) {
+          console.log(`[Controller] 收到屏幕帧: ${frameSize}KB, ${payload.width}x${payload.height}`);
+          handlePeerMessage._frameLogTime = Date.now();
+        }
+      } else if (myRole === 'controller') {
+        console.warn('[Controller] 收到屏幕帧但控制窗口不存在！');
       }
       break;
     }
@@ -407,6 +475,8 @@ function handlePeerMessage(payload, fromRole) {
 // ==================== 屏幕捕获（被控端推流） ====================
 let captureFailCount = 0;
 let captureWarningShown = false;
+let captureFrameCount = 0;
+let lastCaptureTime = 0;
 
 function checkScreenRecordPermission() {
   // macOS: 检查屏幕录制权限
@@ -444,6 +514,7 @@ function notifyCaptureStatus(status) {
 function startScreenCapture() {
   if (captureTimer) return;
   console.log('[Capture] 开始屏幕捕获');
+  console.log('[Capture] 当前状态 - sessionId:', !!sessionId, 'role:', myRole);
 
   // 检查权限
   const hasPermission = checkScreenRecordPermission();
@@ -453,33 +524,60 @@ function startScreenCapture() {
     captureWarningShown = true;
   }
 
+  // 获取屏幕尺寸信息
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+  console.log(`[Capture] 屏幕分辨率: ${width}x${height}`);
+
+  // 使用更合理的缩略图尺寸 - 按比例缩放到合适大小
+  // 目标宽度不超过 1280px，保持宽高比
+  let thumbWidth = Math.floor(width * 0.5);
+  let thumbHeight = Math.floor(height * 0.5);
+  const MAX_WIDTH = 1280;
+  if (thumbWidth > MAX_WIDTH) {
+    const ratio = MAX_WIDTH / thumbWidth;
+    thumbWidth = MAX_WIDTH;
+    thumbHeight = Math.floor(thumbHeight * ratio);
+  }
+  console.log(`[Capture] 缩略图尺寸: ${thumbWidth}x${thumbHeight}`);
+
   const captureOnce = async () => {
     if (!sessionId || myRole !== 'controlled') {
+      console.log('[Capture] 停止捕获: sessionId存在=', !!sessionId, 'role=', myRole);
       stopScreenCapture();
       return;
     }
     try {
-      const primaryDisplay = screen.getPrimaryDisplay();
-      const { width, height } = primaryDisplay.workAreaSize;
-
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
         thumbnailSize: {
-          width: Math.floor(width * 0.7),
-          height: Math.floor(height * 0.7)
+          width: thumbWidth,
+          height: thumbHeight
         }
       });
 
-      if (sources.length > 0) {
+      if (sources.length > 0 && sources[0].thumbnail) {
         captureFailCount = 0;
         const thumb = sources[0].thumbnail;
-        const jpeg = thumb.toJPEG(65);
-        sendToPeer({
+        const jpeg = thumb.toJPEG(50); // 降低质量到50以减小体积
+        const base64 = jpeg.toString('base64');
+        const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
+        
+        // 发送屏幕帧
+        const sent = sendToPeer({
           type: 'screen-frame',
-          image: jpeg.toString('base64'),
+          image: base64,
           width: thumb.getWidth(),
           height: thumb.getHeight()
         });
+        
+        captureFrameCount++;
+        const now = Date.now();
+        if (now - lastCaptureTime >= 5000) { // 每5秒打印一次状态
+          console.log(`[Capture] 已发送 ${captureFrameCount} 帧, 最近帧大小: ${sizeKB}KB, 发送成功: ${sent}`);
+          lastCaptureTime = now;
+        }
+        
         // 首次成功捕获，通知UI权限OK
         if (captureWarningShown) {
           notifyCaptureStatus({ ok: true });
@@ -488,7 +586,9 @@ function startScreenCapture() {
       } else {
         // 无可用屏幕源 - 可能是权限问题
         captureFailCount++;
-        console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次)`);
+        if (captureFailCount <= 3 || captureFailCount % 10 === 0) {
+          console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次)`);
+        }
         if (captureFailCount >= 3 && !captureWarningShown) {
           console.warn('[Capture] 检测到屏幕捕获失败，可能是权限问题');
           notifyCaptureStatus({
@@ -501,7 +601,9 @@ function startScreenCapture() {
       }
     } catch (e) {
       captureFailCount++;
-      console.error('[Capture] 错误:', e.message);
+      if (captureFailCount <= 3 || captureFailCount % 10 === 0) {
+        console.error('[Capture] 错误:', e.message);
+      }
       if (captureFailCount >= 3 && !captureWarningShown) {
         notifyCaptureStatus({
           ok: false,
@@ -515,6 +617,7 @@ function startScreenCapture() {
 
   captureOnce();
   captureTimer = setInterval(captureOnce, CAPTURE_INTERVAL);
+  console.log('[Capture] 捕获定时器已启动, 间隔:', CAPTURE_INTERVAL, 'ms');
 }
 
 function stopScreenCapture() {
@@ -569,12 +672,22 @@ async function handleRemoteCommand(command, params) {
 }
 
 // ==================== IPC 通信（渲染进程） ====================
-ipcMain.handle('get-device-info', () => ({
-  deviceCode: myDeviceCode,
-  password: myPassword,
-  serverConnected,
-  session: sessionId ? { role: myRole, peerCode } : null
-}));
+ipcMain.handle('get-device-info', () => {
+  // 优先用全局变量（服务器连接成功后会更新），否则用本地保存的
+  let code = myDeviceCode;
+  let pwd = myPassword;
+  if (!code || !pwd) {
+    const saved = getSavedDeviceInfo();
+    if (saved.deviceCode) code = saved.deviceCode;
+    if (saved.password) pwd = saved.password;
+  }
+  return {
+    deviceCode: code,
+    password: pwd,
+    serverConnected,
+    session: sessionId ? { role: myRole, peerCode } : null
+  };
+});
 
 ipcMain.handle('refresh-password', () => {
   return sendToServer({ type: 'refresh-password' });

@@ -16,9 +16,14 @@ const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3001;
 const HOSTNAME = os.hostname();
+
+// 设备持久化存储文件
+const DEVICE_DB_FILE = path.join(__dirname, 'device_db.json');
 
 // ==================== 工具函数 ====================
 
@@ -46,6 +51,64 @@ function genUniqueDeviceCode(existing) {
     attempts++;
   }
   return crypto.randomBytes(8).toString('hex').substring(0, 9).replace(/[a-f]/g, '1').padEnd(9, '0');
+}
+
+// ==================== 设备数据库持久化 ====================
+
+/** 
+ * 设备数据库：clientId -> { deviceCode, password, hostname }
+ * 持久化到本地文件，确保重启后设备代码不变
+ */
+let deviceDb = {};
+
+function loadDeviceDb() {
+  try {
+    if (fs.existsSync(DEVICE_DB_FILE)) {
+      const data = fs.readFileSync(DEVICE_DB_FILE, 'utf-8');
+      deviceDb = JSON.parse(data);
+      console.log(`[SVR] 加载设备数据库: ${Object.keys(deviceDb).length} 个设备`);
+    } else {
+      deviceDb = {};
+      console.log('[SVR] 设备数据库为空');
+    }
+  } catch (e) {
+    console.error('[SVR] 加载设备数据库失败:', e.message);
+    deviceDb = {};
+  }
+}
+
+function saveDeviceDb() {
+  try {
+    fs.writeFileSync(DEVICE_DB_FILE, JSON.stringify(deviceDb, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[SVR] 保存设备数据库失败:', e.message);
+  }
+}
+
+function getOrCreateDevice(clientId, hostname) {
+  if (deviceDb[clientId]) {
+    // 已有记录，保持原设备代码和密码
+    const existing = deviceDb[clientId];
+    // 更新 hostname（如果变化了）
+    if (hostname && existing.hostname !== hostname) {
+      existing.hostname = hostname;
+      saveDeviceDb();
+    }
+    console.log(`[SVR] 设备 ${clientId} 使用已有代码: ${formatCode(existing.deviceCode)}`);
+    return existing;
+  }
+  
+  // 新设备，分配新代码
+  const usedCodes = new Set(Object.values(deviceDb).map(d => d.deviceCode));
+  const deviceCode = genUniqueDeviceCode(usedCodes);
+  const password = genPassword();
+  
+  const device = { deviceCode, password, hostname: hostname || '' };
+  deviceDb[clientId] = device;
+  saveDeviceDb();
+  
+  console.log(`[SVR] 新设备 ${clientId} 注册: code=${formatCode(deviceCode)} pwd=${password}`);
+  return device;
 }
 
 // ==================== 数据结构 ====================
@@ -140,34 +203,44 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-  const clientId = crypto.randomUUID();
+  // 从 URL 查询参数获取客户端 ID（稳定标识）
+  const url = new URL(req.url, 'http://localhost');
+  const stableClientId = url.searchParams.get('clientId') || crypto.randomUUID();
+  
+  // 如果是首次连接，没有携带 clientId，就用随机值（兼容旧版本）
+  const isNewClient = !url.searchParams.get('clientId');
+  const clientId = stableClientId;
+  
   let myDeviceCode = null;
   let mySessionId = null;
 
-  console.log(`[SVR] 新连接 client=${clientId}  ip=${req.socket.remoteAddress}`);
+  console.log(`[SVR] 新连接 client=${clientId} ${isNewClient ? '(首次/旧版)' : '(已知设备)'}  ip=${req.socket.remoteAddress}`);
 
-  myDeviceCode = genUniqueDeviceCode(new Set(devices.keys()));
-  const myPassword = genPassword();
+  // 根据 clientId 获取或创建设备信息
+  const savedDevice = getOrCreateDevice(clientId, '');
+  myDeviceCode = savedDevice.deviceCode;
+  let currentPassword = savedDevice.password;
 
   devices.set(myDeviceCode, {
     ws,
-    password: myPassword,
+    password: currentPassword,
     sessionId: null,
     clientId,
     ip: req.socket.remoteAddress,
-    hostname: '',   // 等待客户端上报
+    hostname: savedDevice.hostname || '',   // 使用已保存的 hostname
     registeredAt: Date.now()
   });
   clientToDevice.set(clientId, myDeviceCode);
 
-  console.log(`[SVR] 设备注册 code=${formatCode(myDeviceCode)}  pwd=${myPassword}`);
+  console.log(`[SVR] 设备注册 code=${formatCode(myDeviceCode)}  pwd=${currentPassword}`);
 
   // 下发本机信息
   send(ws, {
     type: 'device-info',
     deviceCode: myDeviceCode,
-    password: myPassword,
-    clientId
+    password: currentPassword,
+    clientId,
+    stableClientId: clientId  // 返回稳定 ID 让客户端保存
   });
 
   // 心跳
@@ -188,6 +261,11 @@ wss.on('connection', (ws, req) => {
         const d = devices.get(myDeviceCode);
         if (d && data.hostname) {
           d.hostname = String(data.hostname).substring(0, 60);
+          // 同步更新持久化数据库
+          if (deviceDb[clientId]) {
+            deviceDb[clientId].hostname = d.hostname;
+            saveDeviceDb();
+          }
           console.log(`[SVR] 设备命名 code=${formatCode(myDeviceCode)}  name=${d.hostname}`);
         }
         break;
@@ -201,7 +279,13 @@ wss.on('connection', (ws, req) => {
         if (d) {
           const newPwd = genPassword();
           d.password = newPwd;
+          // 同步更新持久化数据库
+          if (deviceDb[clientId]) {
+            deviceDb[clientId].password = newPwd;
+            saveDeviceDb();
+          }
           send(ws, { type: 'device-info', deviceCode: myDeviceCode, password: newPwd, clientId });
+          console.log(`[SVR] 密码已刷新: code=${formatCode(myDeviceCode)}  newPwd=${newPwd}`);
         }
         break;
       }
@@ -696,6 +780,9 @@ function extractTunnelUrl(text) {
 }
 
 // ==================== 启动 ====================
+// 加载设备持久化数据库
+loadDeviceDb();
+
 server.listen(PORT, () => {
   console.log(`[SVR] 公共中继服务器已启动: ws://0.0.0.0:${PORT}`);
   console.log(`[SVR] 管理面板: http://0.0.0.0:${PORT}/`);
