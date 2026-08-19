@@ -29,17 +29,36 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Show environment
+        run: |
+          node --version
+          npm --version
+          echo "Architecture: $(uname -m)"
+          echo "Working directory: $(pwd)"
+          ls -la
+
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm install
+
+      - name: Show installed packages
+        run: |
+          echo "=== Package.json ==="
+          cat package.json
+          echo "=== Node modules ==="
+          ls node_modules/ | head -20
 
       - name: Clean dist
-        run: rm -rf dist
+        run: rm -rf dist dist-* 2>/dev/null; echo "Cleaned"
 
       - name: Build DMG (arm64 + x64)
-        run: npx electron-builder --mac --publish never
+        run: npx electron-builder --mac --publish never 2>&1 | tee build.log
 
-      - name: List build output
-        run: ls -la dist/
+      - name: Show build result
+        run: |
+          echo "=== Build output ==="
+          ls -la dist/ 2>/dev/null || echo "No dist directory"
+          echo "=== Build log ==="
+          cat build.log 2>/dev/null || echo "No build log"
 
       - name: Upload DMG artifacts
         uses: actions/upload-artifact@v4
