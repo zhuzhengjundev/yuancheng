@@ -800,13 +800,14 @@ function startScreenCapture() {
   const { width, height } = primaryDisplay.workAreaSize;
   console.log(`[Capture] 屏幕分辨率: ${width}x${height}, 可用工作区: ${primaryDisplay.workAreaSize.width}x${primaryDisplay.workAreaSize.height}`);
 
-  // 使用原始分辨率捕获，但限制最大宽度以控制传输大小
-  const MAX_WIDTH = 1920;
+  // 目标 30KB 左右：将分辨率缩放到合适的大小
+  // 1280 宽度 = 约 1/2 分辨率，在 30KB 下能保持清晰
+  const TARGET_WIDTH = 1280;
   let thumbWidth = width;
   let thumbHeight = height;
-  if (thumbWidth > MAX_WIDTH) {
-    const ratio = MAX_WIDTH / thumbWidth;
-    thumbWidth = MAX_WIDTH;
+  if (thumbWidth > TARGET_WIDTH) {
+    const ratio = TARGET_WIDTH / thumbWidth;
+    thumbWidth = TARGET_WIDTH;
     thumbHeight = Math.floor(thumbHeight * ratio);
   }
   console.log(`[Capture] 捕获尺寸: ${thumbWidth}x${thumbHeight} (原始: ${width}x${height})`);
@@ -885,24 +886,50 @@ function startScreenCapture() {
       const thumb = src.thumbnail;
       // 获取尺寸（兼容 Texture 和 NativeImage）
       const thumbSz = thumb.getSize ? thumb.getSize() : { width: thumb.getWidth(), height: thumb.getHeight() };
-      // 使用 PNG（无压缩，保留原始质量）
-      const png = thumb.toPNG();
-      if (!png || png.length === 0) {
-        captureFailed('empty-jpeg', `toPNG 返回空 buffer`);
+      
+      // 智能 JPEG 压缩：目标 base64 后约 30KB，自动调节画质
+      // raw buffer ≈ base64 * 3/4，所以 raw 目标约 22.5KB
+      const TARGET_RAW = 22 * 1024;   // raw JPEG ≤ 22KB → base64 ≈ 30KB
+      const MAX_RAW = 35 * 1024;      // 上限 35KB raw → base64 ≈ 47KB
+      const MIN_QUALITY = 45;
+      
+      let finalJpeg = null;
+      let finalQuality = 85;
+      
+      // 从高画质开始，逐步降低直到体积达标
+      for (let q = 85; q >= MIN_QUALITY; q -= 3) {
+        const buf = thumb.toJPEG(q);
+        if (!buf || buf.length === 0) continue;
+        finalJpeg = buf;
+        finalQuality = q;
+        
+        if (buf.length <= TARGET_RAW) {
+          // 已达到目标体积，停在这个画质
+          break;
+        }
+        if (buf.length <= MAX_RAW && q <= 70) {
+          // 在允许范围内，不再降低
+          break;
+        }
+      }
+      
+      // 如果还没找到合适的，用最低画质兜底
+      if (!finalJpeg || finalJpeg.length === 0) {
+        finalJpeg = thumb.toJPEG(MIN_QUALITY);
+        finalQuality = MIN_QUALITY;
+      }
+      
+      if (!finalJpeg || finalJpeg.length === 0) {
+        captureFailed('empty-jpeg', `JPEG 编码失败`);
         return;
       }
+      
       // 成功捕获，清除错误
       lastCaptureError = '';
       captureFailCount = 0;
-      const base64 = png.toString('base64');
+      const base64 = finalJpeg.toString('base64');
       const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
-      logCrash(`[Capture] 捕获成功: ${sizeKB}KB ${thumbSz.width}x${thumbSz.height}`);
-        
-        // 检查帧大小 - 超过 2MB 则记录警告
-        const MAX_FRAME_SIZE = 2048 * 1024; // 2MB
-        if (base64.length > MAX_FRAME_SIZE) {
-          console.warn(`[Capture] 帧过大: ${sizeKB}KB, 可能导致传输问题`);
-        }
+      logCrash(`[Capture] 捕获成功: ${sizeKB}KB q=${finalQuality} ${thumbSz.width}x${thumbSz.height}`);
         
         // 发送屏幕帧（包含实际屏幕分辨率用于坐标映射）
         // 发送前检查 session 是否还有效

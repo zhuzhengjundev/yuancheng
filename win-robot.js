@@ -438,7 +438,8 @@ async function sendCmd(cmd) {
 async function updateScreenSize() {
   try {
     const primaryDisplay = screen.getPrimaryDisplay();
-    const { width, height } = primaryDisplay.workAreaSize;
+    // 使用 bounds（完整屏幕区域，包含任务栏），这样可以控制整个屏幕
+    const { width, height } = primaryDisplay.bounds;
     return sendCmd({ op: 'resize', w: width, h: height });
   } catch (e) { return false; }
 }

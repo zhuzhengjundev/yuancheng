@@ -319,7 +319,7 @@
       try {
         if (imageData.length < 100) return;
         
-        const src = 'data:image/png;base64,' + imageData;
+        const src = 'data:image/jpeg;base64,' + imageData;
         screen.src = src;
         
         dbg.frameCount++;
@@ -350,12 +350,12 @@
     function getRelativeCoords(e) {
       const img = $('screen');
       const rect = img.getBoundingClientRect();
-      // 先算相对坐标（0-1）
+      // 计算相对坐标（0.0 - 1.0），C# 端会乘以实际屏幕分辨率
       const relX = (e.clientX - rect.left) / rect.width;
       const relY = (e.clientY - rect.top) / rect.height;
-      // 转换成实际屏幕坐标
-      const x = Math.round(Math.min(realScreenWidth, Math.max(0, relX * realScreenWidth)));
-      const y = Math.round(Math.min(realScreenHeight, Math.max(0, relY * realScreenHeight)));
+      // 限制在 0-1 范围内
+      const x = Math.min(1, Math.max(0, relX));
+      const y = Math.min(1, Math.max(0, relY));
       return { x, y };
     }
 
