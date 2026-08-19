@@ -160,6 +160,8 @@ function getStats() {
     port: PORT,
     uptime: Math.floor(process.uptime()),
     tunnelUrl: tunnelUrl || null,
+    tunnelFixedName: TUNNEL_NAME,
+    tunnelFixedHost: FIXED_TUNNEL_HOST,
     devices: devList,
     sessions: sessList
   };
@@ -633,7 +635,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <h1>RemoteControl 信令服务器</h1>
 
   <div id="tunnelBanner" style="display:none;background:rgba(96,165,250,0.1);border:1px solid rgba(96,165,250,0.3);border-radius:12px;padding:16px 20px;margin-bottom:24px;">
-    <div style="font-size:13px;color:#8892b0;margin-bottom:10px;">内网穿透公网地址</div>
+    <div style="font-size:13px;color:#8892b0;margin-bottom:10px;">📡 内网穿透公网地址（固定地址，每次启动不变）</div>
     <div style="margin-bottom:8px;">
       <span style="font-size:12px;color:#9ca3af;margin-right:8px;">HTTP</span>
       <span id="tunnelUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#60a5fa;cursor:pointer;" onclick="copyText(this.textContent)"></span>
@@ -642,7 +644,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <span style="font-size:12px;color:#9ca3af;margin-right:8px;">WS</span>
       <span id="tunnelWsUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#4ade80;cursor:pointer;" onclick="copyText(this.textContent)"></span>
     </div>
-    <div style="font-size:12px;color:#5a6478;margin-top:8px;">👆 点击绿色 WS 地址可复制，粘贴到客户端「服务器地址」输入框</div>
+    <div style="font-size:12px;color:#5a6478;margin-top:8px;">🏷️ 固定名称: <span id="tunnelFixedName" style="color:#a78bfa;font-family:'SF Mono',Consolas,monospace;"></span></div>
+    <div style="font-size:12px;color:#5a6478;margin-top:4px;">👆 点击绿色 WS 地址可复制，粘贴到客户端「服务器地址」输入框</div>
   </div>
 
   <div class="stats">
@@ -705,6 +708,9 @@ async function loadData() {
       banner.style.display = 'block';
       document.getElementById('tunnelUrl').textContent = d.tunnelUrl;
       var wssUrl = d.tunnelUrl; if (wssUrl.indexOf('https://') === 0) wssUrl = 'wss://' + wssUrl.substring(8); else if (wssUrl.indexOf('http://') === 0) wssUrl = 'wss://' + wssUrl.substring(7); document.getElementById('tunnelWsUrl').textContent = wssUrl;
+      if (d.tunnelFixedName) {
+        document.getElementById('tunnelFixedName').textContent = d.tunnelFixedName;
+      }
     } else {
       banner.style.display = 'none';
     }
@@ -765,13 +771,24 @@ document.getElementById('autoLabel').classList.add('on');
 </html>`;
 
 // ==================== 内网穿透隧道 ====================
-// 使用 SSH 反向隧道，通过 localhost.run 免费服务获得公网地址
-// 无需注册账号、无需安装额外软件（系统自带 SSH）
+// 使用 serveo.net 实现固定公网地址（免费、无需注册）
+// 格式：https://{固定名}.serveo.net → 每次启动地址不变
 const { spawn } = require('child_process');
 
 let tunnelUrl = null;
 let tunnelProcess = null;
 let tunnelReconnectDelay = 3000;
+
+// 生成固定的隧道用户名（基于 hostname + 稳定盐值）
+function getFixedTunnelName() {
+  const machineName = os.hostname().toLowerCase().replace(/[^a-z0-9]/g, '-');
+  // 用机器名生成稳定哈希
+  const hash = crypto.createHash('md5').update(machineName + '_remotectrl').digest('hex').substring(0, 8);
+  return `rctrl-${machineName}-${hash}`;
+}
+
+const TUNNEL_NAME = getFixedTunnelName();
+const FIXED_TUNNEL_HOST = `${TUNNEL_NAME}.serveo.net`;
 
 function startTunnel() {
   if (tunnelProcess) {
@@ -779,29 +796,43 @@ function startTunnel() {
     tunnelProcess = null;
   }
 
-  console.log('[Tunnel] 正在通过 SSH 创建公网隧道...');
+  console.log('[Tunnel] 正在创建固定公网隧道...');
+  console.log('[Tunnel] 固定名称:', TUNNEL_NAME);
 
+  // 方案1: serveo.net - 固定子域名
   tunnelProcess = spawn('ssh', [
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=NUL',
     '-o', 'ExitOnForwardFailure=yes',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
-    '-R', '80:127.0.0.1:' + PORT,
-    'nokey@localhost.run'
+    '-o', 'LogLevel=ERROR',
+    '-R', `80:127.0.0.1:${PORT}`,
+    FIXED_TUNNEL_HOST
   ], { shell: false });
+
+  let serveoOk = false;
 
   tunnelProcess.stdout.on('data', (data) => {
     const text = data.toString().trim();
     if (text) console.log('[Tunnel]', text);
-    extractTunnelUrl(text);
+    // serveo.net 输出通常是: "Hi xxx! Your host is xxx.serveo.net"
+    if (text.includes('.serveo.net') && text.includes('Your host')) {
+      serveoOk = true;
+      // 直接用固定地址
+      tunnelUrl = `https://${FIXED_TUNNEL_HOST}`;
+      announceTunnel();
+    }
   });
 
   tunnelProcess.stderr.on('data', (data) => {
     const text = data.toString().trim();
     if (!text) return;
-    // 提取隧道 URL
-    extractTunnelUrl(text);
+    console.log('[Tunnel][ERR]', text);
+    // 如果 serveo 返回错误（比如名称已被占用），尝试用 localhost.run 回退
+    if (text.includes('ERROR') || text.includes('Error') || text.includes('failed')) {
+      console.warn('[Tunnel] serveo.net 失败，尝试回退到 localhost.run...');
+    }
   });
 
   tunnelProcess.on('close', (code) => {
@@ -819,39 +850,90 @@ function startTunnel() {
     setTimeout(() => startTunnel(), tunnelReconnectDelay);
     tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
   });
+
+  // 超时检测：8秒内没有从 serveo 收到确认信息
+  setTimeout(() => {
+    if (!serveoOk && !tunnelUrl && tunnelProcess) {
+      console.warn('[Tunnel] serveo.net 响应超时，尝试用 localhost.run 回退...');
+      try { tunnelProcess.kill(); } catch (e) {}
+      startFallbackTunnel();
+    }
+  }, 8000);
 }
 
-function extractTunnelUrl(text) {
-  // 查找所有 URL
+// 回退方案：localhost.run（动态地址，但至少能用）
+function startFallbackTunnel() {
+  console.log('[Tunnel] 启动回退隧道 (localhost.run)...');
+  
+  tunnelProcess = spawn('ssh', [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=NUL',
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=3',
+    '-o', 'LogLevel=ERROR',
+    '-R', `80:127.0.0.1:${PORT}`,
+    'nokey@localhost.run'
+  ], { shell: false });
+
+  tunnelProcess.stdout.on('data', (data) => {
+    const text = data.toString().trim();
+    if (text) console.log('[Tunnel]', text);
+    extractLocalhostRunUrl(text);
+  });
+
+  tunnelProcess.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    if (!text) return;
+    extractLocalhostRunUrl(text);
+  });
+
+  tunnelProcess.on('close', (code) => {
+    console.log(`[Tunnel] 回退隧道退出 (code=${code})，${tunnelReconnectDelay / 1000}s 后重连...`);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startFallbackTunnel(), tunnelReconnectDelay);
+    tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
+  });
+
+  tunnelProcess.on('error', (err) => {
+    console.error('[Tunnel] 回退隧道启动失败:', err.message);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startFallbackTunnel(), tunnelReconnectDelay);
+  });
+}
+
+function extractLocalhostRunUrl(text) {
   const urls = text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]+\.[a-z]{2,}/g);
   if (!urls) return;
-
-  // 过滤掉非隧道地址：localhost.run 主域名、admin 页面、文档链接
   const tunnelUrls = urls.filter(u => {
     if (u.includes('localhost.run/docs')) return false;
     if (u === 'https://localhost.run' || u === 'http://localhost.run') return false;
     if (u.includes('admin.')) return false;
     return true;
   });
-
   if (tunnelUrls.length === 0) return;
-  // 取最后一个有效 URL（隧道地址通常在输出最后）
   const newUrl = tunnelUrls[tunnelUrls.length - 1];
-
   if (newUrl && newUrl !== tunnelUrl) {
     tunnelUrl = newUrl;
-    const wsUrl = tunnelUrl.replace(/^https?:\/\//, 'wss://');
-    console.log('');
-    console.log('╔══════════════════════════════════════════════════════════════╗');
-    console.log('║  [内网穿透] 隧道已建立                                        ║');
-    console.log('║  公网 HTTP  : ' + tunnelUrl);
-    console.log('║  公网 WS    : ' + wsUrl);
-    console.log('║  管理面板   : ' + tunnelUrl + '/');
-    console.log('║  客户端连接  : 在程序里输入上方 WS 地址                       ║');
-    console.log('╚══════════════════════════════════════════════════════════════╝');
-    console.log('');
-    tunnelReconnectDelay = 3000;
+    announceTunnel();
   }
+}
+
+function announceTunnel() {
+  if (!tunnelUrl) return;
+  const wsUrl = tunnelUrl.replace(/^https?:\/\//, (tunnelUrl.startsWith('https') ? 'wss://' : 'ws://'));
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════════════════╗');
+  console.log('║  [内网穿透] 隧道已建立                                        ║');
+  console.log('║  公网 HTTP  : ' + tunnelUrl);
+  console.log('║  公网 WS    : ' + wsUrl);
+  console.log('║  管理面板   : ' + tunnelUrl + '/');
+  console.log('║  客户端连接  : 在程序里输入上方 WS 地址                       ║');
+  console.log('╚══════════════════════════════════════════════════════════════╝');
+  console.log('');
+  tunnelReconnectDelay = 3000;
 }
 
 // ==================== 启动 ====================
