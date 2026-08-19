@@ -803,7 +803,12 @@ function startTunnel() {
 }
 
 function tryServeo() {
-  console.log('[Tunnel] 尝试 serveo.net...');
+  console.log('[Tunnel] 尝试 serveo.net (固定子域名)...');
+  
+  // 使用 用户名@serveo.net 格式可获得固定子域名
+  // 默认用户名基于机器名生成，保证每次相同
+  const serveoUser = STABLE_NAME;
+  const serveoHost = `${serveoUser}@serveo.net`;
   
   tunnelProcess = spawn('ssh', [
     '-o', 'StrictHostKeyChecking=no',
@@ -813,15 +818,16 @@ function tryServeo() {
     '-o', 'ServerAliveCountMax=3',
     '-o', 'LogLevel=ERROR',
     '-R', `80:127.0.0.1:${PORT}`,
-    'serveo.net'
+    serveoHost
   ], { shell: false });
 
   let foundUrl = false;
 
   function parseServeoUrl(text) {
-    // 匹配: https://xxx.serveousercontent.com 或 https://xxx.serveo.net
-    const match = text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]*\.serveousercontent\.com/i) ||
-                  text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]*\.serveo\.net/i);
+    // 优先匹配固定子域名: xxx.serveo.net
+    // 也兼容随机域名: xxx.serveousercontent.com
+    const match = text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]*\.serveo\.net/i) ||
+                  text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]*\.serveousercontent\.com/i);
     if (match) {
       foundUrl = true;
       tunnelType = 'serveo';
