@@ -343,6 +343,9 @@ wss.on('connection', (ws, req) => {
         });
         mySessionId = sessionId;
         target.sessionId = sessionId;
+        // 关键修复：在被控端的 WebSocket 上也设置 mySessionId，
+        // 否则被控端发送 to-peer 消息时服务器找不到会话
+        target.ws.mySessionId = sessionId;
 
         console.log(`[SVR] 会话建立 ${shortSession(sessionId)}: ${formatCode(myDeviceCode)} -> ${formatCode(targetCode)}`);
 
@@ -370,9 +373,30 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'to-peer': {
-        const sess = sessions.get(mySessionId);
+        // 查找会话 - 优先用 mySessionId，回退用 myDeviceCode 搜索
+        let sess = null;
+        let effectiveSessionId = mySessionId;
+        
+        if (mySessionId) {
+          sess = sessions.get(mySessionId);
+        }
+        
+        // 回退：如果 mySessionId 为空或找不到会话，通过 myDeviceCode 搜索
+        if (!sess && myDeviceCode) {
+          for (const [sid, s] of sessions) {
+            if (s.controllerCode === myDeviceCode || s.controlledCode === myDeviceCode) {
+              sess = s;
+              effectiveSessionId = sid;
+              // 自动修复：设置 mySessionId 以便后续快速查找
+              ws.mySessionId = sid;
+              console.log(`[SVR] to-peer 回退查找成功: ${sid}`);
+              break;
+            }
+          }
+        }
+        
         if (!sess) {
-          console.warn(`[SVR] to-peer 失败: 会话不存在, mySessionId=${mySessionId}`);
+          console.warn(`[SVR] to-peer 失败: 会话不存在, mySessionId=${mySessionId}, myDeviceCode=${myDeviceCode}`);
           send(ws, { type: 'error', message: '会话不存在' });
           return;
         }
@@ -389,7 +413,7 @@ wss.on('connection', (ws, req) => {
           // 构建转发消息
           const forwardMsg = {
             type: 'from-peer',
-            sessionId: mySessionId,
+            sessionId: effectiveSessionId,
             fromRole: sess.controllerCode === myDeviceCode ? 'controller' : 'controlled',
             payload: data.payload
           };
