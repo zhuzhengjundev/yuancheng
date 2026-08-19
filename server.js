@@ -789,6 +789,8 @@ function getFixedTunnelName() {
 
 const TUNNEL_NAME = getFixedTunnelName();
 const FIXED_TUNNEL_HOST = `${TUNNEL_NAME}.serveo.net`;
+const fixedHttpUrl = `https://${FIXED_TUNNEL_HOST}`;
+const fixedWsUrl = `wss://${FIXED_TUNNEL_HOST}`;
 
 function startTunnel() {
   if (tunnelProcess) {
@@ -924,13 +926,20 @@ function extractLocalhostRunUrl(text) {
 function announceTunnel() {
   if (!tunnelUrl) return;
   const wsUrl = tunnelUrl.replace(/^https?:\/\//, (tunnelUrl.startsWith('https') ? 'wss://' : 'ws://'));
+  const isFixed = tunnelUrl === fixedHttpUrl;
   console.log('');
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  [内网穿透] 隧道已建立                                        ║');
+  if (isFixed) {
+    console.log('║  [内网穿透] ✓ 固定隧道已建立                                  ║');
+  } else {
+    console.log('║  [内网穿透] 隧道已建立 (回退模式)                             ║');
+    console.log('║  注意: 当前地址非固定，重启后可能变化                         ║');
+  }
+  console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log('║  公网 HTTP  : ' + tunnelUrl);
   console.log('║  公网 WS    : ' + wsUrl);
   console.log('║  管理面板   : ' + tunnelUrl + '/');
-  console.log('║  客户端连接  : 在程序里输入上方 WS 地址                       ║');
+  console.log('║  客户端连接  : ' + wsUrl);
   console.log('╚══════════════════════════════════════════════════════════════╝');
   console.log('');
   tunnelReconnectDelay = 3000;
@@ -941,11 +950,22 @@ function announceTunnel() {
 loadDeviceDb();
 
 server.listen(PORT, () => {
-  console.log(`[SVR] 公共中继服务器已启动: ws://0.0.0.0:${PORT}`);
-  console.log(`[SVR] 管理面板: http://0.0.0.0:${PORT}/`);
-  console.log(`[SVR] 健康检查: http://0.0.0.0:${PORT}/health`);
-  console.log(`[SVR] API 接口: http://0.0.0.0:${PORT}/api/stats`);
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════════════════╗');
+  console.log('║          RemoteControl 远程控制服务器已启动                  ║');
+  console.log('╠══════════════════════════════════════════════════════════════╣');
+  console.log(`║  本地服务    : ws://0.0.0.0:${PORT}`);
+  console.log(`║  管理面板    : http://127.0.0.1:${PORT}/`);
+  console.log(`║`);
+  console.log(`║  ★ 固定公网地址（客户端直接连这个）                        ║`);
+  console.log(`║  HTTP 面板   : ${fixedHttpUrl}`);
+  console.log(`║  WS 连接地址 : ${fixedWsUrl}`);
+  console.log(`║`);
+  console.log(`║  固定名称    : ${TUNNEL_NAME}`);
+  console.log(`║  注意        : 首次启动需等待内网穿透建立 (约5-10秒)        ║`);
+  console.log('╚══════════════════════════════════════════════════════════════╝');
+  console.log('');
   console.log(`[SVR] 等待客户端连接...`);
-  console.log(`[SVR] 正在启动内网穿透隧道...`);
+  console.log(`[SVR] 正在建立内网穿透隧道...`);
   startTunnel();
 });
