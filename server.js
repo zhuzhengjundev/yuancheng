@@ -22,52 +22,6 @@ const path = require('path');
 const PORT = process.env.PORT || 3001;
 const HOSTNAME = os.hostname();
 
-// 获取本机局域网IP
-function getLocalIPs() {
-  const interfaces = os.networkInterfaces();
-  const ips = [];
-  for (const [name, addrs] of Object.entries(interfaces)) {
-    for (const addr of addrs) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        ips.push({ name, ip: addr.address });
-      }
-    }
-  }
-  return ips;
-}
-
-// 异步获取公网IP
-function getPublicIP() {
-  return new Promise((resolve) => {
-    const urls = [
-      'https://api.ipify.org',
-      'https://ifconfig.me',
-      'https://icanhazip.com'
-    ];
-    let done = false;
-    
-    for (const url of urls) {
-      const req = http.get(url, (res) => {
-        if (done) return;
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          if (done) return;
-          done = true;
-          resolve(data.trim());
-        });
-      });
-      req.on('error', () => {});
-      req.on('timeout', () => { try { req.destroy(); } catch(e){} });
-      req.setTimeout(5000);
-    }
-    
-    setTimeout(() => {
-      if (!done) { done = true; resolve(null); }
-    }, 6000);
-  });
-}
-
 // 设备持久化存储文件
 const DEVICE_DB_FILE = path.join(__dirname, 'device_db.json');
 
@@ -206,8 +160,6 @@ function getStats() {
     port: PORT,
     uptime: Math.floor(process.uptime()),
     tunnelUrl: tunnelUrl || null,
-    tunnelService: tunnelType || null,
-    deviceId: STABLE_NAME,
     devices: devList,
     sessions: sessList
   };
@@ -681,17 +633,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <h1>RemoteControl 信令服务器</h1>
 
   <div id="tunnelBanner" style="display:none;background:rgba(96,165,250,0.1);border:1px solid rgba(96,165,250,0.3);border-radius:12px;padding:16px 20px;margin-bottom:24px;">
-    <div style="font-size:13px;color:#8892b0;margin-bottom:10px;">📡 内网穿透公网地址</div>
+    <div style="font-size:13px;color:#8892b0;margin-bottom:10px;">内网穿透公网地址</div>
     <div style="margin-bottom:8px;">
       <span style="font-size:12px;color:#9ca3af;margin-right:8px;">HTTP</span>
       <span id="tunnelUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#60a5fa;cursor:pointer;" onclick="copyText(this.textContent)"></span>
     </div>
-    <div style="margin-bottom:8px;">
+    <div>
       <span style="font-size:12px;color:#9ca3af;margin-right:8px;">WS</span>
       <span id="tunnelWsUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#4ade80;cursor:pointer;" onclick="copyText(this.textContent)"></span>
     </div>
-    <div style="font-size:12px;color:#5a6478;margin-top:4px;">🏷️ 服务: <span id="tunnelService" style="color:#a78bfa;"></span> &nbsp;·&nbsp; 设备: <span id="tunnelDeviceId" style="color:#a78bfa;font-family:'SF Mono',Consolas,monospace;"></span></div>
-    <div style="font-size:12px;color:#5a6478;margin-top:4px;">👆 点击绿色 WS 地址可复制，粘贴到客户端「服务器地址」输入框</div>
+    <div style="font-size:12px;color:#5a6478;margin-top:8px;">👆 点击绿色 WS 地址可复制，粘贴到客户端「服务器地址」输入框</div>
   </div>
 
   <div class="stats">
@@ -754,12 +705,6 @@ async function loadData() {
       banner.style.display = 'block';
       document.getElementById('tunnelUrl').textContent = d.tunnelUrl;
       var wssUrl = d.tunnelUrl; if (wssUrl.indexOf('https://') === 0) wssUrl = 'wss://' + wssUrl.substring(8); else if (wssUrl.indexOf('http://') === 0) wssUrl = 'wss://' + wssUrl.substring(7); document.getElementById('tunnelWsUrl').textContent = wssUrl;
-      if (d.tunnelService) {
-        document.getElementById('tunnelService').textContent = d.tunnelService;
-      }
-      if (d.deviceId) {
-        document.getElementById('tunnelDeviceId').textContent = d.deviceId;
-      }
     } else {
       banner.style.display = 'none';
     }
@@ -820,77 +765,93 @@ document.getElementById('autoLabel').classList.add('on');
 </html>`;
 
 // ==================== 内网穿透隧道 ====================
-// 使用 localtunnel 实现固定公网子域名（免费、无需注册）
-const localtunnel = require('localtunnel');
+// 使用 SSH 反向隧道，通过 localhost.run 免费服务获得公网地址
+// 无需注册账号、无需安装额外软件（系统自带 SSH）
+const { spawn } = require('child_process');
 
 let tunnelUrl = null;
 let tunnelProcess = null;
-let tunnelType = 'localtunnel';
+let tunnelReconnectDelay = 3000;
 
-// 生成稳定的隧道子域名
-function getStableSubdomain() {
-  const machineName = os.hostname().toLowerCase().replace(/[^a-z0-9]/g, '');
-  const hash = crypto.createHash('md5').update(machineName + '_remotectrl').digest('hex').substring(0, 6);
-  // localtunnel subdomain 限制: 最多20字符，只能小写字母数字
-  return 'rctrl' + machineName.substring(0, 8) + hash;
-}
-const STABLE_SUBDOMAIN = getStableSubdomain();
-const STABLE_NAME = STABLE_SUBDOMAIN;
-
-async function startTunnel() {
-  try {
-    console.log('[Tunnel] 正在创建内网穿透隧道 (localtunnel)...');
-    console.log('[Tunnel] 固定子域名:', STABLE_SUBDOMAIN);
-
-    tunnelProcess = await localtunnel({
-      port: PORT,
-      subdomain: STABLE_SUBDOMAIN
-    });
-
-    tunnelUrl = tunnelProcess.url;
-    console.log('[Tunnel] 隧道已建立');
-    
-    announceTunnel();
-
-    tunnelProcess.on('close', () => {
-      console.log('[Tunnel] 隧道关闭，3s 后重连...');
-      tunnelUrl = null;
-      setTimeout(() => startTunnel(), 3000);
-    });
-
-    tunnelProcess.on('error', (err) => {
-      console.error('[Tunnel] 隧道错误:', err.message);
-      tunnelUrl = null;
-      setTimeout(() => startTunnel(), 5000);
-    });
-
-    // 每10秒检查一次隧道是否仍然活跃
-    setInterval(() => {
-      if (tunnelProcess && tunnelProcess._clients === 0 && tunnelProcess._stats) {
-        // 没有活跃连接时的检查（防止内存泄漏）
-      }
-    }, 10000);
-
-  } catch (err) {
-    console.error('[Tunnel] 隧道创建失败:', err.message);
-    tunnelUrl = null;
-    setTimeout(() => startTunnel(), 5000);
+function startTunnel() {
+  if (tunnelProcess) {
+    try { tunnelProcess.kill(); } catch (e) {}
+    tunnelProcess = null;
   }
+
+  console.log('[Tunnel] 正在通过 SSH 创建公网隧道...');
+
+  tunnelProcess = spawn('ssh', [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=NUL',
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=3',
+    '-R', '80:127.0.0.1:' + PORT,
+    'nokey@localhost.run'
+  ], { shell: false });
+
+  tunnelProcess.stdout.on('data', (data) => {
+    const text = data.toString().trim();
+    if (text) console.log('[Tunnel]', text);
+    extractTunnelUrl(text);
+  });
+
+  tunnelProcess.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    if (!text) return;
+    // 提取隧道 URL
+    extractTunnelUrl(text);
+  });
+
+  tunnelProcess.on('close', (code) => {
+    console.log(`[Tunnel] SSH 进程退出 (code=${code})，${tunnelReconnectDelay / 1000}s 后重连...`);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startTunnel(), tunnelReconnectDelay);
+    tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
+  });
+
+  tunnelProcess.on('error', (err) => {
+    console.error('[Tunnel] SSH 启动失败:', err.message);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startTunnel(), tunnelReconnectDelay);
+    tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
+  });
 }
 
-function announceTunnel() {
-  if (!tunnelUrl) return;
-  const wsUrl = tunnelUrl.replace(/^http/, 'ws');
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log(`║  [内网穿透] ✓ 隧道已建立 (固定地址)                          `);
-  console.log('╠══════════════════════════════════════════════════════════════╣');
-  console.log(`║  公网 HTTP  : ${tunnelUrl}`);
-  console.log(`║  公网 WS    : ${wsUrl}`);
-  console.log(`║  管理面板   : ${tunnelUrl}/`);
-  console.log(`║  设备标识   : ${STABLE_NAME}`);
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
+function extractTunnelUrl(text) {
+  // 查找所有 URL
+  const urls = text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]+\.[a-z]{2,}/g);
+  if (!urls) return;
+
+  // 过滤掉非隧道地址：localhost.run 主域名、admin 页面、文档链接
+  const tunnelUrls = urls.filter(u => {
+    if (u.includes('localhost.run/docs')) return false;
+    if (u === 'https://localhost.run' || u === 'http://localhost.run') return false;
+    if (u.includes('admin.')) return false;
+    return true;
+  });
+
+  if (tunnelUrls.length === 0) return;
+  // 取最后一个有效 URL（隧道地址通常在输出最后）
+  const newUrl = tunnelUrls[tunnelUrls.length - 1];
+
+  if (newUrl && newUrl !== tunnelUrl) {
+    tunnelUrl = newUrl;
+    const wsUrl = tunnelUrl.replace(/^https?:\/\//, 'wss://');
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║  [内网穿透] 隧道已建立                                        ║');
+    console.log('║  公网 HTTP  : ' + tunnelUrl);
+    console.log('║  公网 WS    : ' + wsUrl);
+    console.log('║  管理面板   : ' + tunnelUrl + '/');
+    console.log('║  客户端连接  : 在程序里输入上方 WS 地址                       ║');
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log('');
+    tunnelReconnectDelay = 3000;
+  }
 }
 
 // ==================== 启动 ====================
@@ -898,20 +859,11 @@ function announceTunnel() {
 loadDeviceDb();
 
 server.listen(PORT, () => {
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║          RemoteControl 远程控制服务器已启动                  ║');
-  console.log('╠══════════════════════════════════════════════════════════════╣');
-  console.log(`║  本地服务    : ws://0.0.0.0:${PORT}`);
-  console.log(`║  管理面板    : http://127.0.0.1:${PORT}/`);
-  console.log(`║  设备标识    : ${STABLE_NAME}`);
-  console.log(`║  固定子域名  : ${STABLE_SUBDOMAIN}`);
-  console.log(`║`);
-  console.log(`║  ★ 公网地址将在隧道建立后显示 (约5-10秒)                   ║`);
-  console.log(`║    使用 localtunnel，地址永久固定不变                        ║`);
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
+  console.log(`[SVR] 公共中继服务器已启动: ws://0.0.0.0:${PORT}`);
+  console.log(`[SVR] 管理面板: http://0.0.0.0:${PORT}/`);
+  console.log(`[SVR] 健康检查: http://0.0.0.0:${PORT}/health`);
+  console.log(`[SVR] API 接口: http://0.0.0.0:${PORT}/api/stats`);
   console.log(`[SVR] 等待客户端连接...`);
-  console.log(`[SVR] 正在建立内网穿透隧道...`);
+  console.log(`[SVR] 正在启动内网穿透隧道...`);
   startTunnel();
 });
