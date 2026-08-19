@@ -14,16 +14,54 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const WebSocket = require('ws');
 
+// ============ 配置文件（读写 WS 地址） ============
+const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+
+function loadConfig() {
+  try {
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
+    return JSON.parse(raw);
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveConfig(cfg) {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[CFG] 保存配置失败:', e.message);
+  }
+}
+
+function getSavedWsUrl() {
+  return loadConfig().wsUrl || null;
+}
+
+function setSavedWsUrl(url) {
+  const cfg = loadConfig();
+  cfg.wsUrl = url;
+  saveConfig(cfg);
+  console.log('[CFG] 已保存 WS 地址:', url);
+}
+
 // ============ 服务器地址 ============
-// 优先环境变量，否则使用用户指定的公共服务器
-const SERVER_URLS = [
-  process.env.RELAY_URL,
-  'ws://172.21.22.244:3001',
-  'ws://127.0.0.1:3001',
-  'ws://localhost:3001'
-].filter(Boolean);
+let currentWsUrl = null;   // 当前使用的 WS 地址（从配置或用户输入）
+let SERVER_URLS = [];      // 候选地址列表
+
+function buildServerUrls() {
+  const saved = getSavedWsUrl();
+  const urls = [];
+  if (saved) urls.push(saved);
+  if (process.env.RELAY_URL) urls.push(process.env.RELAY_URL);
+  urls.push('ws://127.0.0.1:3001');
+  urls.push('ws://localhost:3001');
+  // 去重
+  return [...new Set(urls)];
+}
 
 // ============ 全局状态 ============
 let mainWindow = null;
@@ -49,7 +87,7 @@ let captureTimer = null;
 const CAPTURE_INTERVAL = 150;
 
 // ==================== 窗口 ====================
-function createMainWindow() {
+function createMainWindow(page) {
   mainWindow = new BrowserWindow({
     width: 480,
     height: 820,
@@ -64,7 +102,14 @@ function createMainWindow() {
   });
 
   mainWindow.setMenuBarVisibility(false);
-  mainWindow.loadFile('index.html');
+
+  if (page === 'setup') {
+    const saved = getSavedWsUrl();
+    const mode = saved ? 'expired' : 'first';
+    mainWindow.loadFile('setup.html', { query: { mode } });
+  } else {
+    mainWindow.loadFile('index.html');
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -113,7 +158,11 @@ function connectServer() {
 
   let sock;
   try {
-    sock = new WebSocket(url, { timeout: 5000 });
+    const wsOpts = { timeout: 5000 };
+    if (url.startsWith('wss://')) {
+      wsOpts.rejectUnauthorized = false;
+    }
+    sock = new WebSocket(url, wsOpts);
   } catch (e) {
     serverUrlIndex++;
     scheduleReconnect(500);
@@ -471,6 +520,61 @@ ipcMain.handle('disconnect', () => {
   return true;
 });
 
+// ==================== IPC：WS 地址管理 ====================
+// 校验 WS 地址是否可连通
+ipcMain.handle('validate-ws-url', async (_e, { url }) => {
+  const trimmed = (url || '').trim();
+  if (!trimmed) return { success: false, message: '地址不能为空' };
+  if (!trimmed.match(/^wss?:\/\/.+/)) {
+    return { success: false, message: '地址需以 ws:// 或 wss:// 开头' };
+  }
+  console.log('[APP] 校验 WS 地址:', trimmed);
+  const result = await validateWsUrl(trimmed);
+  console.log('[APP] 校验结果:', result.success ? '成功' : '失败 - ' + result.message);
+  return result;
+});
+
+// 保存 WS 地址到配置文件
+ipcMain.handle('save-ws-url', (_e, { url }) => {
+  const trimmed = (url || '').trim();
+  setSavedWsUrl(trimmed);
+  currentWsUrl = trimmed;
+  SERVER_URLS = buildServerUrls();
+  return { success: true };
+});
+
+// 获取当前保存的 WS 地址
+ipcMain.handle('get-ws-url', () => {
+  return getSavedWsUrl();
+});
+
+// 从 setup 页面确认后，进入首页
+ipcMain.handle('goto-home', () => {
+  // 断开旧连接
+  if (ws) { try { ws.close(); } catch (e) {} }
+  serverConnected = false;
+  serverUrlIndex = 0;
+  SERVER_URLS = buildServerUrls();  // 确保用最新保存的地址
+  // 重新加载首页
+  if (mainWindow) {
+    mainWindow.loadFile('index.html');
+  }
+  // 延迟一点等页面加载完
+  setTimeout(() => connectServer(), 500);
+  return true;
+});
+
+// 从首页点击修改按钮，跳转到 setup 页面
+ipcMain.handle('goto-setup', () => {
+  // 断开当前连接
+  if (ws) { try { ws.close(); } catch (e) {} }
+  serverConnected = false;
+  if (mainWindow) {
+    mainWindow.loadFile('setup.html', { query: { mode: 'modify' } });
+  }
+  return true;
+});
+
 // 从 control window 发出的键鼠命令（主控 -> 被控）
 ipcMain.handle('send-command', (_e, { command, params }) => {
   if (!sessionId) return { success: false };
@@ -510,14 +614,84 @@ function formatCode(code) {
   return code.slice(0, 3) + ' ' + code.slice(3, 6) + ' ' + code.slice(6);
 }
 
+// ==================== WS 地址校验 ====================
+function validateWsUrl(url) {
+  return new Promise((resolve) => {
+    if (!url || !url.match(/^wss?:\/\/.+/)) {
+      resolve({ success: false, message: '地址格式无效' });
+      return;
+    }
+    let done = false;
+    const opts = { timeout: 6000 };
+    if (url.startsWith('wss://')) opts.rejectUnauthorized = false;
+
+    let sock;
+    try {
+      sock = new WebSocket(url, opts);
+    } catch (e) {
+      resolve({ success: false, message: e.message });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (!done) {
+        done = true;
+        try { sock.terminate(); } catch (e) {}
+        resolve({ success: false, message: '连接超时' });
+      }
+    }, 6500);
+
+    sock.on('open', () => {
+      if (!done) {
+        done = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch (e) {}
+        resolve({ success: true });
+      }
+    });
+
+    sock.on('error', (err) => {
+      if (!done) {
+        done = true;
+        clearTimeout(timer);
+        resolve({ success: false, message: err.message || '连接失败' });
+      }
+    });
+  });
+}
+
 // ==================== Electron 生命周期 ====================
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   getWinRobot();
-  createMainWindow();
-  connectServer();
+
+  const savedUrl = getSavedWsUrl();
+  if (!savedUrl) {
+    // 首次进入：跳转到 setup 页面
+    console.log('[APP] 首次使用，跳转到服务器设置页面');
+    createMainWindow('setup');
+  } else {
+    // 非首次：先校验保存的地址
+    console.log('[APP] 校验保存的 WS 地址:', savedUrl);
+    const result = await validateWsUrl(savedUrl);
+    if (result.success) {
+      // 地址有效，直接进入首页
+      currentWsUrl = savedUrl;
+      SERVER_URLS = buildServerUrls();
+      createMainWindow('home');
+      connectServer();
+    } else {
+      // 地址失效，跳转到 setup 页面
+      console.log('[APP] 保存的 WS 地址已失效:', result.message);
+      createMainWindow('setup');
+    }
+  }
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      const saved = getSavedWsUrl();
+      createMainWindow(saved ? 'home' : 'setup');
+      if (saved) connectServer();
+    }
   });
 });
 

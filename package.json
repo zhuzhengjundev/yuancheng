@@ -7,21 +7,26 @@
     "start": "concurrently \"node server.js\" \"electron .\"",
     "server": "node server.js",
     "app": "electron .",
-    "build": "electron-builder --win",
-    "build:mac": "electron-builder --mac"
+    "build": "electron-builder --win --publish never",
+    "build:mac": "electron-builder --mac --publish never"
   },
-  "keywords": ["electron", "remote-desktop", "remote-control"],
+  "keywords": [
+    "electron",
+    "remote-desktop",
+    "remote-control"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "ws": "^8.14.2",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
-    "electron": "^27.0.0",
     "concurrently": "^8.2.2",
-    "electron-builder": "^24.6.4"
+    "electron": "^27.3.11",
+    "electron-builder": "^24.6.4",
+    "semver": "^7.8.5"
   },
   "build": {
     "appId": "com.remotecontrol.app",
@@ -34,6 +39,7 @@
       "preload.js",
       "win-robot.js",
       "index.html",
+      "setup.html",
       "control.html",
       "incoming.html",
       "package.json",
@@ -53,7 +59,10 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["x64", "arm64"]
+          "arch": [
+            "x64",
+            "arm64"
+          ]
         }
       ],
       "category": "public.app-category.utilities",
@@ -63,9 +72,20 @@
     "dmg": {
       "title": "RemoteControl Installer",
       "contents": [
-        { "x": 130, "y": 220 },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     }
+  },
+  "optionalDependencies": {
+    "which": "^7.0.0"
   }
 }

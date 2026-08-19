@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>服务器设置</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .setup-card {
+      width: 400px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 16px;
+      padding: 36px 32px;
+    }
+    .setup-card h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .setup-card .subtitle {
+      font-size: 13px;
+      color: #9ca3af;
+      margin-bottom: 24px;
+    }
+    .field { margin-bottom: 20px; }
+    .field label {
+      display: block;
+      font-size: 13px;
+      color: #9ca3af;
+      margin-bottom: 6px;
+    }
+    .input {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: #e6edf3;
+      font-size: 14px;
+      font-family: 'SF Mono', Consolas, monospace;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .input:focus { border-color: #60a5fa; }
+    .input::placeholder { color: #5a6478; }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: #3b82f6;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-primary:disabled {
+      background: #1e3a5f;
+      color: #6a7d8a;
+      cursor: not-allowed;
+    }
+    .error-msg {
+      display: none;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: #ef4444;
+      margin-bottom: 16px;
+    }
+    .hint {
+      font-size: 12px;
+      color: #5a6478;
+      margin-top: 16px;
+      line-height: 1.6;
+    }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #6a7d8a;
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="setup-card">
+    <h1>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+        <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+        <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+        <line x1="12" y1="20" x2="12.01" y2="20"/>
+      </svg>
+      <span id="titleText">服务器设置</span>
+    </h1>
+    <p class="subtitle" id="subtitleText">请输入服务器 WebSocket 地址</p>
+
+    <div class="error-msg" id="errorMsg"></div>
+
+    <div class="field">
+      <label>WS 地址</label>
+      <input class="input" id="inputWsUrl" type="text" placeholder="wss://example.com" autocomplete="off" autofocus>
+    </div>
+
+    <button class="btn btn-primary" id="btnConfirm">确认连接</button>
+
+    <p class="hint">
+      💡 请从服务器管理面板复制绿色 WS 地址粘贴到此处<br>
+      地址格式：ws://IP:端口 或 wss://域名
+    </p>
+  </div>
+
+  <script>
+    const api = window.remoteAPI || {};
+    const $ = (id) => document.getElementById(id);
+
+    // 从 URL 参数读取模式（first / expired / modify）
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode') || 'first';
+    const expired = params.get('expired') === '1';
+
+    // 根据模式设置文案
+    if (mode === 'first') {
+      $('titleText').textContent = '欢迎使用远程控制';
+      $('subtitleText').textContent = '首次使用，请输入服务器 WebSocket 地址';
+    } else if (mode === 'expired') {
+      $('titleText').textContent = '服务器地址已失效';
+      $('subtitleText').textContent = '当前 WS 地址已失效，重新输入 WS 地址';
+      showError('当前 WS 地址已失效，重新输入 WS 地址');
+    } else if (mode === 'modify') {
+      $('titleText').textContent = '修改服务器地址';
+      $('subtitleText').textContent = '请输入新的服务器 WebSocket 地址';
+      // 修改模式时回填当前地址
+      if (api.getWsUrl) {
+        const cur = api.getWsUrl();
+        if (cur) $('inputWsUrl').value = cur;
+      }
+    }
+
+    function showError(msg) {
+      const el = $('errorMsg');
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+
+    function hideError() {
+      $('errorMsg').style.display = 'none';
+    }
+
+    async function handleConfirm() {
+      hideError();
+      const url = $('inputWsUrl').value.trim();
+      if (!url) {
+        showError('请输入 WS 地址');
+        return;
+      }
+      if (!url.match(/^wss?:\/\/.+/)) {
+        showError('地址需以 ws:// 或 wss:// 开头');
+        return;
+      }
+
+      // 禁用按钮，显示加载状态
+      const btn = $('btnConfirm');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>正在验证连接...';
+
+      try {
+        const result = await api.validateWsUrl(url);
+        if (result.success) {
+          // 验证通过，保存地址并进入首页
+          api.saveWsUrl(url);
+          // 通知主进程进入首页
+          api.gotoHome();
+        } else {
+          showError('该 WS 地址无效，重新输入 WS 地址');
+          btn.disabled = false;
+          btn.textContent = '确认连接';
+        }
+      } catch (e) {
+        showError('该 WS 地址无效，重新输入 WS 地址');
+        btn.disabled = false;
+        btn.textContent = '确认连接';
+      }
+    }
+
+    $('btnConfirm').onclick = handleConfirm;
+    $('inputWsUrl').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleConfirm();
+    });
+  </script>
+</body>
+</html>

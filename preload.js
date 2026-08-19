@@ -12,6 +12,13 @@ contextBridge.exposeInMainWorld('remoteAPI', {
     ipcRenderer.invoke('connect-device', { targetCode, targetPassword }),
   disconnect: () => ipcRenderer.invoke('disconnect'),
 
+  // ============ WS 地址管理（setup.html + index.html） ============
+  validateWsUrl: (url) => ipcRenderer.invoke('validate-ws-url', { url }),
+  saveWsUrl: (url) => ipcRenderer.invoke('save-ws-url', { url }),
+  getWsUrl: () => ipcRenderer.invoke('get-ws-url'),
+  gotoHome: () => ipcRenderer.invoke('goto-home'),
+  gotoSetup: () => ipcRenderer.invoke('goto-setup'),
+
   // 主窗口事件
   onAppStatus: (callback) => {
     const h = (_e, d) => callback(d);

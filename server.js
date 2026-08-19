@@ -13,6 +13,7 @@
 
 const WebSocket = require('ws');
 const http = require('http');
+const net = require('net');
 const crypto = require('crypto');
 const os = require('os');
 
@@ -95,6 +96,7 @@ function getStats() {
     hostname: HOSTNAME,
     port: PORT,
     uptime: Math.floor(process.uptime()),
+    tunnelUrl: tunnelUrl || null,
     devices: devList,
     sessions: sessList
   };
@@ -471,6 +473,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <h1>RemoteControl 信令服务器</h1>
 
+  <div id="tunnelBanner" style="display:none;background:rgba(96,165,250,0.1);border:1px solid rgba(96,165,250,0.3);border-radius:12px;padding:16px 20px;margin-bottom:24px;">
+    <div style="font-size:13px;color:#8892b0;margin-bottom:10px;">内网穿透公网地址</div>
+    <div style="margin-bottom:8px;">
+      <span style="font-size:12px;color:#9ca3af;margin-right:8px;">HTTP</span>
+      <span id="tunnelUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#60a5fa;cursor:pointer;" onclick="copyText(this.textContent)"></span>
+    </div>
+    <div>
+      <span style="font-size:12px;color:#9ca3af;margin-right:8px;">WS</span>
+      <span id="tunnelWsUrl" style="font-family:'SF Mono',Consolas,monospace;font-size:14px;color:#4ade80;cursor:pointer;" onclick="copyText(this.textContent)"></span>
+    </div>
+    <div style="font-size:12px;color:#5a6478;margin-top:8px;">👆 点击绿色 WS 地址可复制，粘贴到客户端「服务器地址」输入框</div>
+  </div>
+
   <div class="stats">
     <div class="stat-card">
       <div class="label">在线设备</div>
@@ -495,6 +510,20 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <script>
 let autoTimer = null;
 
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => {
+    alert('已复制: ' + text);
+  }).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    alert('已复制: ' + text);
+  });
+}
+
 function fmtCode(c) {
   if (!c || c.length !== 9) return c;
   return c.slice(0,3)+' '+c.slice(3,6)+' '+c.slice(6);
@@ -510,6 +539,16 @@ async function loadData() {
     const m = Math.floor(d.uptime / 60);
     const s = d.uptime % 60;
     document.getElementById('statUptime').textContent = m > 0 ? m+'m '+s+'s' : s+'s';
+
+    // 显示隧道公网地址
+    const banner = document.getElementById('tunnelBanner');
+    if (d.tunnelUrl) {
+      banner.style.display = 'block';
+      document.getElementById('tunnelUrl').textContent = d.tunnelUrl;
+      var wssUrl = d.tunnelUrl; if (wssUrl.indexOf('https://') === 0) wssUrl = 'wss://' + wssUrl.substring(8); else if (wssUrl.indexOf('http://') === 0) wssUrl = 'wss://' + wssUrl.substring(7); document.getElementById('tunnelWsUrl').textContent = wssUrl;
+    } else {
+      banner.style.display = 'none';
+    }
 
     const dl = document.getElementById('deviceList');
     if (!d.devices.length) {
@@ -566,6 +605,96 @@ document.getElementById('autoLabel').classList.add('on');
 </body>
 </html>`;
 
+// ==================== 内网穿透隧道 ====================
+// 使用 SSH 反向隧道，通过 localhost.run 免费服务获得公网地址
+// 无需注册账号、无需安装额外软件（系统自带 SSH）
+const { spawn } = require('child_process');
+
+let tunnelUrl = null;
+let tunnelProcess = null;
+let tunnelReconnectDelay = 3000;
+
+function startTunnel() {
+  if (tunnelProcess) {
+    try { tunnelProcess.kill(); } catch (e) {}
+    tunnelProcess = null;
+  }
+
+  console.log('[Tunnel] 正在通过 SSH 创建公网隧道...');
+
+  tunnelProcess = spawn('ssh', [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=NUL',
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=3',
+    '-R', '80:127.0.0.1:' + PORT,
+    'nokey@localhost.run'
+  ], { shell: false });
+
+  tunnelProcess.stdout.on('data', (data) => {
+    const text = data.toString().trim();
+    if (text) console.log('[Tunnel]', text);
+    extractTunnelUrl(text);
+  });
+
+  tunnelProcess.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    if (!text) return;
+    // 提取隧道 URL
+    extractTunnelUrl(text);
+  });
+
+  tunnelProcess.on('close', (code) => {
+    console.log(`[Tunnel] SSH 进程退出 (code=${code})，${tunnelReconnectDelay / 1000}s 后重连...`);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startTunnel(), tunnelReconnectDelay);
+    tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
+  });
+
+  tunnelProcess.on('error', (err) => {
+    console.error('[Tunnel] SSH 启动失败:', err.message);
+    tunnelUrl = null;
+    tunnelProcess = null;
+    setTimeout(() => startTunnel(), tunnelReconnectDelay);
+    tunnelReconnectDelay = Math.min(tunnelReconnectDelay * 1.5, 30000);
+  });
+}
+
+function extractTunnelUrl(text) {
+  // 查找所有 URL
+  const urls = text.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]+\.[a-z]{2,}/g);
+  if (!urls) return;
+
+  // 过滤掉非隧道地址：localhost.run 主域名、admin 页面、文档链接
+  const tunnelUrls = urls.filter(u => {
+    if (u.includes('localhost.run/docs')) return false;
+    if (u === 'https://localhost.run' || u === 'http://localhost.run') return false;
+    if (u.includes('admin.')) return false;
+    return true;
+  });
+
+  if (tunnelUrls.length === 0) return;
+  // 取最后一个有效 URL（隧道地址通常在输出最后）
+  const newUrl = tunnelUrls[tunnelUrls.length - 1];
+
+  if (newUrl && newUrl !== tunnelUrl) {
+    tunnelUrl = newUrl;
+    const wsUrl = tunnelUrl.replace(/^https?:\/\//, 'wss://');
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║  [内网穿透] 隧道已建立                                        ║');
+    console.log('║  公网 HTTP  : ' + tunnelUrl);
+    console.log('║  公网 WS    : ' + wsUrl);
+    console.log('║  管理面板   : ' + tunnelUrl + '/');
+    console.log('║  客户端连接  : 在程序里输入上方 WS 地址                       ║');
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log('');
+    tunnelReconnectDelay = 3000;
+  }
+}
+
 // ==================== 启动 ====================
 server.listen(PORT, () => {
   console.log(`[SVR] 公共中继服务器已启动: ws://0.0.0.0:${PORT}`);
@@ -573,4 +702,6 @@ server.listen(PORT, () => {
   console.log(`[SVR] 健康检查: http://0.0.0.0:${PORT}/health`);
   console.log(`[SVR] API 接口: http://0.0.0.0:${PORT}/api/stats`);
   console.log(`[SVR] 等待客户端连接...`);
+  console.log(`[SVR] 正在启动内网穿透隧道...`);
+  startTunnel();
 });

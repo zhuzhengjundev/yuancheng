@@ -6,15 +6,18 @@
   <title>远程控制</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { overflow: hidden; height: 100%; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
       background: linear-gradient(180deg, #6b7be8 0%, #5464d4 260px, #f4f6fc 260px, #f4f6fc 100%);
-      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
       color: #333;
     }
 
     /* ========== 顶部标题区 ========== */
     .header {
+      position: relative;
       padding: 36px 24px 28px;
       text-align: center;
       color: #fff;
@@ -48,8 +51,36 @@
     }
     .server-status.online .dot { background: #22c55e; }
 
+    /* ========== 设置按钮 ========== */
+    .settings-btn {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 36px; height: 36px;
+      border: none;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.18);
+      color: #fff;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.2s;
+      backdrop-filter: blur(6px);
+    }
+    .settings-btn:hover { background: rgba(255,255,255,0.3); }
+
     /* ========== 卡片 ========== */
-    .wrap { padding: 0 16px 24px; max-width: 460px; margin: 0 auto; }
+    .header { flex-shrink: 0; }
+    .wrap {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 0 16px 24px;
+      max-width: 460px;
+      margin: 0 auto;
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+    .wrap::-webkit-scrollbar { display: none; width: 0; height: 0; }
     .card {
       background: #fff;
       border-radius: 18px;
@@ -237,10 +268,18 @@
 </head>
 <body>
   <div class="header">
+    <button class="settings-btn" id="btnSettings" title="修改服务器地址">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
     <div class="icon">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="2" y="3" width="20" height="14" rx="2"/>
-        <path d="M8 21h8M12 17v4"/>
+        <rect x="3" y="3" width="18" height="13" rx="2"/>
+        <line x1="12" y1="16" x2="12" y2="19"/>
+        <line x1="8" y1="19" x2="16" y2="19"/>
+        <path d="M5 4l6 6-2 1-1 2-1-1-2 2z" fill="currentColor" stroke="none"/>
       </svg>
     </div>
     <h1>远程控制</h1>
@@ -421,6 +460,11 @@
     function clearError() { $('errTip').classList.remove('show'); }
 
     // ============ 事件 ============
+    // 修改服务器地址
+    $('btnSettings').onclick = () => {
+      if (api.gotoSetup) api.gotoSetup();
+    };
+
     $('btnCopyCode').onclick = async () => {
       const info = await api.getDeviceInfo();
       if (info && info.deviceCode) {
