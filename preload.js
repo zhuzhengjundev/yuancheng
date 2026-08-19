@@ -58,11 +58,27 @@ contextBridge.exposeInMainWorld('remoteAPI', {
   syncClipboard: (content) =>
     ipcRenderer.invoke('sync-clipboard', { content }),
 
+  // 分块传输：帧头
+  onScreenFrameHeader: (callback) => {
+    const h = (_e, d) => callback(d);
+    ipcRenderer.on('screen-frame-header', h);
+    return () => ipcRenderer.removeListener('screen-frame-header', h);
+  },
+  
+  // 分块传输：数据块
+  onScreenFrameChunk: (callback) => {
+    const h = (_e, d) => callback(d);
+    ipcRenderer.on('screen-frame-chunk', h);
+    return () => ipcRenderer.removeListener('screen-frame-chunk', h);
+  },
+  
+  // 兼容旧格式（完整帧一次性发送）
   onScreenFrame: (callback) => {
     const h = (_e, d) => callback(d);
     ipcRenderer.on('screen-frame', h);
     return () => ipcRenderer.removeListener('screen-frame', h);
   },
+  
   onSessionEnded: (callback) => {
     const h = () => callback();
     ipcRenderer.on('session-ended', h);

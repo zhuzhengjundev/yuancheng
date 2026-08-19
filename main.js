@@ -121,10 +121,13 @@ let myClientId = '';
 let sessionId = null;
 let myRole = null;       // 'controller' | 'controlled'
 let peerCode = null;
+let frameEverReceived = false; // 主控端是否曾收到过帧
 
 // 屏幕捕获
 let captureTimer = null;
 const CAPTURE_INTERVAL = 150;
+let captureFrameCount = 0;
+let captureFailCount = 0;
 
 // ==================== 窗口 ====================
 function createMainWindow(page) {
@@ -161,6 +164,9 @@ function createControlWindow() {
     controlWindow.focus();
     return;
   }
+  console.log('[Control] 创建控制窗口...');
+  frameEverReceived = false;
+  
   controlWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -178,15 +184,41 @@ function createControlWindow() {
   
   // 窗口加载完成后通知被控端开始推屏
   controlWindow.webContents.once('did-finish-load', () => {
-    console.log('[Control] 控制窗口已加载完成，请求被控端开始推屏');
-    // 如果是主控端，请求被控端推屏
-    if (myRole === 'controller' && sessionId) {
-      sendToPeer({ type: 'screen-start' });
-    }
+    console.log('[Control] 控制窗口已加载完成 (did-finish-load)');
+    // 延迟一点时间确保渲染进程完全就绪
+    setTimeout(() => {
+      console.log('[Control] 请求被控端开始推屏...');
+      if (myRole === 'controller' && sessionId) {
+        const sent = sendToPeer({ type: 'screen-start' });
+        console.log('[Control] screen-start 发送结果:', sent ? '成功' : '失败');
+      } else {
+        console.warn('[Control] 无法发送 screen-start: myRole=' + myRole + ', sessionId=' + !!sessionId);
+      }
+      
+      // 重试机制：如果2秒内没有收到帧，重新请求
+      setTimeout(() => {
+        if (!frameEverReceived && controlWindow) {
+          console.warn('[Control] 2秒内未收到任何帧，重新请求 screen-start...');
+          sendToPeer({ type: 'screen-start' });
+        }
+      }, 2000);
+      
+      setTimeout(() => {
+        if (!frameEverReceived && controlWindow) {
+          console.warn('[Control] 5秒内仍未收到帧，再次请求...');
+          sendToPeer({ type: 'screen-start' });
+        }
+      }, 5000);
+    }, 500);
+  });
+  
+  // 处理加载失败
+  controlWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('[Control] 控制窗口加载失败:', errorCode, errorDescription);
   });
   
   controlWindow.on('closed', () => {
-    // 主控关闭窗口 -> 结束会话
+    console.log('[Control] 控制窗口已关闭');
     if (myRole === 'controller') {
       sendToServer({ type: 'disconnect' });
       stopScreenCapture();
@@ -332,12 +364,25 @@ function handleServerMessage(data) {
       sessionId = data.sessionId;
       myRole = data.role;
       peerCode = data.peerCode;
-      console.log(`[APP] 会话建立，我是主控，对方=${formatCode(peerCode)}`);
+      console.log(`[APP] ========== 会话建立 ==========`);
+      console.log(`[APP] 会话ID: ${data.sessionId}`);
+      console.log(`[APP] 角色: ${myRole}`);
+      console.log(`[APP] 对方设备: ${formatCode(peerCode)}`);
 
-      if (!controlWindow) createControlWindow();
-      
-      // 注意：screen-start 将在控制窗口加载完成后发送（在 createControlWindow 的 did-finish-load 中）
-      // 这样可以确保控制窗口已经准备好接收屏幕帧
+      // 创建控制窗口（screen-start 将在窗口加载完成后发送）
+      if (!controlWindow) {
+        console.log('[APP] 创建控制窗口...');
+        createControlWindow();
+      } else {
+        console.log('[APP] 控制窗口已存在，直接发送 screen-start');
+        // 控制窗口已存在，直接发送 screen-start
+        setTimeout(() => {
+          if (myRole === 'controller' && sessionId) {
+            const sent = sendToPeer({ type: 'screen-start' });
+            console.log('[APP] screen-start 发送结果:', sent ? '成功' : '失败');
+          }
+        }, 300);
+      }
 
       notifyMainStatus();
       if (mainWindow) {
@@ -355,11 +400,18 @@ function handleServerMessage(data) {
       sessionId = data.sessionId;
       myRole = data.role;
       peerCode = data.peerCode;
-      console.log(`[APP] 被控制请求，来自=${formatCode(peerCode)}`);
+      console.log(`[APP] ========== 被控制请求 ==========`);
+      console.log(`[APP] 来自: ${formatCode(peerCode)}`);
+      console.log(`[APP] 角色: ${myRole}`);
+      console.log(`[APP] 会话ID: ${data.sessionId}`);
 
       // 自动接受并开始推屏
+      console.log('[APP] 自动接受控制，开始推屏...');
       startScreenCapture();
-      sendToServer({ type: 'accept-control' });
+      
+      // 发送 accept-control 确认
+      const acceptSent = sendToServer({ type: 'accept-control' });
+      console.log('[APP] accept-control 发送结果:', acceptSent ? '成功' : '失败');
 
       notifyMainStatus();
       if (mainWindow) {
@@ -413,35 +465,89 @@ function cleanupSession(disconnected) {
 
 // ==================== 对端消息处理 ====================
 function handlePeerMessage(payload, fromRole) {
-  if (!payload || typeof payload !== 'object') return;
+  if (!payload || typeof payload !== 'object') {
+    console.warn('[Peer] 收到无效payload:', payload);
+    return;
+  }
+  
+  // 记录所有收到的消息类型（调试用）
+  if (!handlePeerMessage._msgLogTime || Date.now() - handlePeerMessage._msgLogTime >= 10000) {
+    console.log(`[Peer] 收到消息: type=${payload.type}, fromRole=${fromRole}`);
+    handlePeerMessage._msgLogTime = Date.now();
+  }
+  
   switch (payload.type) {
     case 'screen-start': {
       // 主控让我（被控）开始推屏
+      console.log('[Peer] 收到 screen-start 请求');
       if (myRole === 'controlled') {
         startScreenCapture();
+      } else {
+        console.warn('[Peer] 收到 screen-start 但我不是被控端, myRole=', myRole);
       }
       break;
     }
     case 'screen-stop': {
+      console.log('[Peer] 收到 screen-stop 请求');
       stopScreenCapture();
       break;
     }
     case 'screen-frame': {
-      // 推给控制窗口渲染
-      if (controlWindow && myRole === 'controller') {
-        const frameSize = payload.image ? (payload.image.length * 3 / 4 / 1024).toFixed(1) : 0;
-        controlWindow.webContents.send('screen-frame', {
-          image: payload.image,
-          width: payload.width,
-          height: payload.height
-        });
-        // 每5秒打印一次接收状态
-        if (!handlePeerMessage._frameLogTime || Date.now() - handlePeerMessage._frameLogTime >= 5000) {
-          console.log(`[Controller] 收到屏幕帧: ${frameSize}KB, ${payload.width}x${payload.height}`);
-          handlePeerMessage._frameLogTime = Date.now();
+      if (!payload.image) {
+        console.warn('[Peer] 收到空的 screen-frame');
+        break;
+      }
+      
+      if (!controlWindow) {
+        if (!handlePeerMessage._noWindowWarnTime || Date.now() - handlePeerMessage._noWindowWarnTime >= 5000) {
+          console.warn('[Controller] 收到屏幕帧但控制窗口不存在！');
+          handlePeerMessage._noWindowWarnTime = Date.now();
         }
-      } else if (myRole === 'controller') {
-        console.warn('[Controller] 收到屏幕帧但控制窗口不存在！');
+        break;
+      }
+      
+      if (myRole !== 'controller') break;
+      
+      // 标记已收到帧
+      if (!frameEverReceived) {
+        frameEverReceived = true;
+        console.log('[Controller] ========== 首次收到屏幕帧 ==========');
+      }
+      
+      // 分块传输方案：将大图像分成小块发送
+      const CHUNK_SIZE = 8192; // 每块 8KB
+      const imageData = payload.image;
+      const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
+      const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+      
+      // 先发送帧头信息
+      controlWindow.webContents.send('screen-frame-header', {
+        frameId,
+        width: payload.width,
+        height: payload.height,
+        totalChunks,
+        imageSize: imageData.length
+      });
+      
+      // 分块发送
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, imageData.length);
+        const chunk = imageData.substring(start, end);
+        
+        controlWindow.webContents.send('screen-frame-chunk', {
+          frameId,
+          chunkIndex: i,
+          totalChunks,
+          data: chunk
+        });
+      }
+      
+      // 每5秒打印一次状态
+      if (!handlePeerMessage._frameLogTime || Date.now() - handlePeerMessage._frameLogTime >= 5000) {
+        const frameSizeKB = (imageData.length * 3 / 4 / 1024).toFixed(1);
+        console.log(`[Controller] 屏幕帧已分块发送: ${frameSizeKB}KB, ${payload.width}x${payload.height}, ${totalChunks}块`);
+        handlePeerMessage._frameLogTime = Date.now();
       }
       break;
     }
@@ -473,9 +579,7 @@ function handlePeerMessage(payload, fromRole) {
 }
 
 // ==================== 屏幕捕获（被控端推流） ====================
-let captureFailCount = 0;
 let captureWarningShown = false;
-let captureFrameCount = 0;
 let lastCaptureTime = 0;
 
 function checkScreenRecordPermission() {
@@ -512,9 +616,12 @@ function notifyCaptureStatus(status) {
 }
 
 function startScreenCapture() {
-  if (captureTimer) return;
-  console.log('[Capture] 开始屏幕捕获');
-  console.log('[Capture] 当前状态 - sessionId:', !!sessionId, 'role:', myRole);
+  if (captureTimer) {
+    console.log('[Capture] 捕获定时器已存在，跳过启动');
+    return;
+  }
+  console.log('[Capture] ========== 开始屏幕捕获 ==========');
+  console.log('[Capture] 当前状态 - sessionId:', !!sessionId, 'role:', myRole, 'ws.readyState:', ws ? ws.readyState : 'no ws');
 
   // 检查权限
   const hasPermission = checkScreenRecordPermission();
@@ -527,13 +634,12 @@ function startScreenCapture() {
   // 获取屏幕尺寸信息
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width, height } = primaryDisplay.workAreaSize;
-  console.log(`[Capture] 屏幕分辨率: ${width}x${height}`);
+  console.log(`[Capture] 屏幕分辨率: ${width}x${height}, 可用工作区: ${primaryDisplay.workAreaSize.width}x${primaryDisplay.workAreaSize.height}`);
 
-  // 使用更合理的缩略图尺寸 - 按比例缩放到合适大小
-  // 目标宽度不超过 1280px，保持宽高比
-  let thumbWidth = Math.floor(width * 0.5);
-  let thumbHeight = Math.floor(height * 0.5);
-  const MAX_WIDTH = 1280;
+  // 计算缩略图尺寸 - 目标最大宽度960px，保持宽高比
+  const MAX_WIDTH = 960;
+  let thumbWidth = Math.floor(width * 0.4);
+  let thumbHeight = Math.floor(height * 0.4);
   if (thumbWidth > MAX_WIDTH) {
     const ratio = MAX_WIDTH / thumbWidth;
     thumbWidth = MAX_WIDTH;
@@ -541,6 +647,7 @@ function startScreenCapture() {
   }
   console.log(`[Capture] 缩略图尺寸: ${thumbWidth}x${thumbHeight}`);
 
+  // 立即执行一次捕获
   const captureOnce = async () => {
     if (!sessionId || myRole !== 'controlled') {
       console.log('[Capture] 停止捕获: sessionId存在=', !!sessionId, 'role=', myRole);
@@ -559,9 +666,16 @@ function startScreenCapture() {
       if (sources.length > 0 && sources[0].thumbnail) {
         captureFailCount = 0;
         const thumb = sources[0].thumbnail;
-        const jpeg = thumb.toJPEG(50); // 降低质量到50以减小体积
+        // 使用较低的JPEG质量以减小体积
+        const jpeg = thumb.toJPEG(40);
         const base64 = jpeg.toString('base64');
         const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
+        
+        // 检查帧大小 - 如果太大则跳过
+        const MAX_FRAME_SIZE = 500 * 1024; // 500KB
+        if (base64.length > MAX_FRAME_SIZE * 4 / 3) {
+          console.warn(`[Capture] 帧过大: ${sizeKB}KB, 可能导致传输问题`);
+        }
         
         // 发送屏幕帧
         const sent = sendToPeer({
@@ -572,9 +686,11 @@ function startScreenCapture() {
         });
         
         captureFrameCount++;
+        
+        // 每5秒打印一次状态
         const now = Date.now();
-        if (now - lastCaptureTime >= 5000) { // 每5秒打印一次状态
-          console.log(`[Capture] 已发送 ${captureFrameCount} 帧, 最近帧大小: ${sizeKB}KB, 发送成功: ${sent}`);
+        if (now - lastCaptureTime >= 5000) {
+          console.log(`[Capture] 状态: 已发送 ${captureFrameCount} 帧, 最近帧大小: ${sizeKB}KB, 发送结果: ${sent ? '成功' : '失败'}`);
           lastCaptureTime = now;
         }
         
@@ -584,10 +700,10 @@ function startScreenCapture() {
           captureWarningShown = false;
         }
       } else {
-        // 无可用屏幕源 - 可能是权限问题
+        // 无可用屏幕源
         captureFailCount++;
         if (captureFailCount <= 3 || captureFailCount % 10 === 0) {
-          console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次)`);
+          console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次), sources.length: ${sources.length}`);
         }
         if (captureFailCount >= 3 && !captureWarningShown) {
           console.warn('[Capture] 检测到屏幕捕获失败，可能是权限问题');
@@ -615,7 +731,12 @@ function startScreenCapture() {
     }
   };
 
-  captureOnce();
+  // 立即执行一次捕获（延迟100ms确保状态就绪）
+  setTimeout(() => {
+    console.log('[Capture] 执行首次捕获...');
+    captureOnce();
+  }, 100);
+  
   captureTimer = setInterval(captureOnce, CAPTURE_INTERVAL);
   console.log('[Capture] 捕获定时器已启动, 间隔:', CAPTURE_INTERVAL, 'ms');
 }

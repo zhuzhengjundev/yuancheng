@@ -198,9 +198,17 @@
     const api = window.remoteAPI;
     const $ = id => document.getElementById(id);
 
+    console.log('[Control] ========== 初始化控制窗口 ==========');
+    console.log('[Control] remoteAPI 可用:', !!api);
+    console.log('[Control] onScreenFrameHeader 可用:', !!api.onScreenFrameHeader);
+    console.log('[Control] onScreenFrameChunk 可用:', !!api.onScreenFrameChunk);
+
     // ====== FPS 计算 ======
     let frameCount = 0;
     let lastFpsTime = performance.now();
+    let totalFrames = 0;
+    let lastFrameReceiveTime = 0;
+    
     setInterval(() => {
       const now = performance.now();
       const elapsed = (now - lastFpsTime) / 1000;
@@ -210,30 +218,147 @@
       lastFpsTime = now;
     }, 1000);
 
-    // ====== 画面渲染 ======
-    let receivedFrameCount = 0;
-    let lastFrameTime = performance.now();
+    // ====== 分块接收与重组 ======
+    // 当前正在接收的帧数据
+    let currentFrame = null; // { frameId, width, height, totalChunks, chunks: [], received: Set }
     
-    api.onScreenFrame(({ image, width, height }) => {
-      if (!image) {
-        console.warn('[Control] 收到空帧');
+    function renderAssembledFrame() {
+      if (!currentFrame) return;
+      
+      const { width, height, chunks, totalChunks } = currentFrame;
+      
+      // 检查是否收齐所有块
+      const receivedCount = Object.keys(chunks).length;
+      if (receivedCount < totalChunks) return;
+      
+      // 按顺序组装所有块
+      let imageData = '';
+      for (let i = 0; i < totalChunks; i++) {
+        if (chunks[i] === undefined) {
+          console.warn('[Control] 缺失块:', i, '共', totalChunks, '块');
+          return;
+        }
+        imageData += chunks[i];
+      }
+      
+      // 清理当前帧（立即释放内存）
+      const frameId = currentFrame.frameId;
+      currentFrame = null;
+      
+      // 渲染图像
+      totalFrames++;
+      frameCount++;
+      lastFrameReceiveTime = performance.now();
+      const now = performance.now();
+      
+      // 第一帧
+      if (totalFrames === 1) {
+        console.log('[Control] ========== 画面传输开始 ==========');
+        console.log('[Control] 分辨率:', width, 'x', height, '帧大小:', (imageData.length * 3 / 4 / 1024).toFixed(1), 'KB');
+        $('fpsDisplay').textContent = '画面传输中';
+      }
+      
+      // 定期显示详细信息
+      if (now - lastFrameTime >= 5000) {
+        const imgSize = (imageData.length * 3 / 4 / 1024).toFixed(1);
+        console.log(`[Control] 统计: 总${totalFrames}帧, 当前帧: ${imgSize}KB, ${width}x${height}`);
+        $('frameInfo').textContent = `${width}x${height} | ${imgSize}KB | 总${totalFrames}帧`;
+        $('frameInfo').style.display = 'inline';
+        lastFrameTime = now;
+      }
+      
+      const screen = $('screen');
+      try {
+        if (imageData.length < 100) {
+          console.warn('[Control] 组装后的帧数据过短');
+          return;
+        }
+        
+        const src = 'data:image/jpeg;base64,' + imageData;
+        screen.src = src;
+        
+        if (screen.classList.contains('hidden')) {
+          screen.classList.remove('hidden');
+          $('placeholder').classList.add('hidden');
+          console.log('[Control] 画面已显示');
+        }
+      } catch (err) {
+        console.error('[Control] 渲染帧失败:', err.message);
+      }
+    }
+    
+    // 接收帧头
+    api.onScreenFrameHeader((header) => {
+      if (!header || !header.frameId) {
+        console.warn('[Control] 收到无效的帧头');
         return;
       }
       
-      receivedFrameCount++;
-      const now = performance.now();
-      
-      // 更新FPS和显示信息
-      if (receivedFrameCount === 1) {
-        $('fpsDisplay').textContent = '已连接';
+      // 丢弃旧帧（如果接收时间过长）
+      if (currentFrame && currentFrame.frameId !== header.frameId) {
+        const age = Date.now() - (currentFrame.startTime || 0);
+        if (age > 500) {
+          console.log('[Control] 丢弃旧帧 (超时)');
+          currentFrame = null;
+        }
       }
       
-      // 每5秒显示一次详细信息
+      currentFrame = {
+        frameId: header.frameId,
+        width: header.width,
+        height: header.height,
+        totalChunks: header.totalChunks,
+        chunks: new Array(header.totalChunks),
+        startTime: Date.now()
+      };
+      
+      // 如果只有1块，直接渲染
+      if (header.totalChunks === 1) {
+        // 等待块数据到达
+      }
+    });
+    
+    // 接收数据块
+    api.onScreenFrameChunk((chunk) => {
+      if (!chunk || !currentFrame) {
+        if (!currentFrame) {
+          console.warn('[Control] 收到数据块但当前没有帧头');
+        }
+        return;
+      }
+      
+      if (chunk.frameId !== currentFrame.frameId) {
+        // 丢弃过期的块
+        return;
+      }
+      
+      // 存储块
+      currentFrame.chunks[chunk.chunkIndex] = chunk.data;
+      
+      // 检查是否收齐
+      const receivedCount = currentFrame.chunks.filter(c => c !== undefined).length;
+      if (receivedCount >= currentFrame.totalChunks) {
+        renderAssembledFrame();
+      }
+    });
+    
+    // 兼容旧格式（完整帧一次性发送）
+    api.onScreenFrame(({ image, width, height }) => {
+      if (!image) return;
+      
+      totalFrames++;
+      frameCount++;
+      lastFrameReceiveTime = performance.now();
+      const now = performance.now();
+      
+      if (totalFrames === 1) {
+        console.log('[Control] ========== 收到第一帧 (旧格式) ==========');
+        $('fpsDisplay').textContent = '画面传输中';
+      }
+      
       if (now - lastFrameTime >= 5000) {
         const imgSize = (image.length * 3 / 4 / 1024).toFixed(1);
-        console.log(`[Control] 帧统计: 收到${receivedFrameCount}帧, 当前帧: ${imgSize}KB, 分辨率: ${width}x${height}`);
-        $('frameInfo').textContent = `${width}x${height} | ${imgSize}KB`;
-        $('frameInfo').style.display = 'inline';
+        console.log(`[Control] 统计(旧格式): 总${totalFrames}帧, ${imgSize}KB, ${width}x${height}`);
         lastFrameTime = now;
       }
       
@@ -243,13 +368,27 @@
         if (screen.classList.contains('hidden')) {
           screen.classList.remove('hidden');
           $('placeholder').classList.add('hidden');
-          console.log('[Control] 画面已显示');
+          console.log('[Control] 画面已显示 (旧格式)');
         }
-        frameCount++;
       } catch (err) {
         console.error('[Control] 渲染帧失败:', err.message);
       }
     });
+    
+    console.log('[Control] 帧接收器已启动，等待画面...');
+    
+    // 超时清理：每 500ms 检查一次是否有过期的帧
+    setInterval(() => {
+      if (currentFrame) {
+        const age = Date.now() - currentFrame.startTime;
+        if (age > 500) {
+          // 超过 500ms 还没收齐，丢弃
+          const receivedCount = currentFrame.chunks.filter(c => c !== undefined).length;
+          console.log(`[Control] 丢弃超时帧 ${currentFrame.frameId}: ${receivedCount}/${currentFrame.totalChunks} 块`);
+          currentFrame = null;
+        }
+      }
+    }, 100);
 
     // ====== 鼠标事件 ======
     function getRelativeCoords(e) {

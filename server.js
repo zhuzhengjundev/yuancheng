@@ -200,7 +200,15 @@ const server = http.createServer((req, res) => {
 });
 
 // ==================== WebSocket 服务 ====================
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+  server,
+  // 配置 WebSocket 服务器以支持大消息
+  maxPayload: 10 * 1024 * 1024,  // 10MB 最大消息大小
+  perMessageDeflate: {
+    zlibWindowBits: -15,
+    threshold: 1024  // 压缩超过1KB的消息
+  }
+});
 
 wss.on('connection', (ws, req) => {
   // 从 URL 查询参数获取客户端 ID（稳定标识）
@@ -363,16 +371,59 @@ wss.on('connection', (ws, req) => {
 
       case 'to-peer': {
         const sess = sessions.get(mySessionId);
-        if (!sess) return;
+        if (!sess) {
+          console.warn(`[SVR] to-peer 失败: 会话不存在, mySessionId=${mySessionId}`);
+          send(ws, { type: 'error', message: '会话不存在' });
+          return;
+        }
         const peerCode = sess.controllerCode === myDeviceCode ? sess.controlledCode : sess.controllerCode;
         const peer = devices.get(peerCode);
-        if (peer) {
-          send(peer.ws, {
+        if (peer && peer.ws && peer.ws.readyState === WebSocket.OPEN) {
+          // 检查payload类型和大小
+          const payloadType = data.payload ? data.payload.type : 'unknown';
+          let payloadSize = 0;
+          if (data.payload && data.payload.image) {
+            payloadSize = Math.round(data.payload.image.length * 3 / 4 / 1024);
+          }
+          
+          // 构建转发消息
+          const forwardMsg = {
             type: 'from-peer',
             sessionId: mySessionId,
             fromRole: sess.controllerCode === myDeviceCode ? 'controller' : 'controlled',
             payload: data.payload
-          });
+          };
+          
+          // 序列化并检查大小
+          const serialized = JSON.stringify(forwardMsg);
+          const msgSizeKB = Math.round(serialized.length / 1024);
+          
+          // 记录大消息警告
+          if (msgSizeKB > 500) {
+            console.warn(`[SVR] 转发大消息: type=${payloadType}, size=${msgSizeKB}KB, peer=${formatCode(peerCode)}`);
+          }
+          
+          // 发送
+          try {
+            peer.ws.send(serialized, (err) => {
+              if (err) {
+                console.error(`[SVR] 转发失败: type=${payloadType}, error=${err.message}`);
+              }
+            });
+            
+            // 每10秒打印一次转发状态（用于调试）
+            if (!wss._forwardLogTime || Date.now() - wss._forwardLogTime >= 10000) {
+              console.log(`[SVR] 转发消息: type=${payloadType}, size=${msgSizeKB}KB, 到=${formatCode(peerCode)}`);
+              wss._forwardLogTime = Date.now();
+            }
+          } catch (sendErr) {
+            console.error(`[SVR] 转发异常: type=${payloadType}, error=${sendErr.message}`);
+          }
+        } else {
+          console.warn(`[SVR] to-peer 失败: 对端不存在或未连接, peerCode=${formatCode(peerCode)}, peer=${!!peer}`);
+          if (peer) {
+            console.log(`[SVR] peer.ws.readyState=${peer.ws ? peer.ws.readyState : 'no ws'}`);
+          }
         }
         break;
       }
