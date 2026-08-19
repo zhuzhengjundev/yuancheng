@@ -32,7 +32,7 @@
     "appId": "com.remotecontrol.app",
     "productName": "RemoteControl",
     "directories": {
-      "output": "dist-v4"
+      "output": "dist"
     },
     "files": [
       "main.js",
