@@ -256,6 +256,84 @@ wss.on('connection', (ws, req) => {
     send(ws, { type: 'ping', t: Date.now() });
   }, 30000);
 
+  // 分块重组缓冲区（每个连接独立）
+  const chunkBuffers = new Map();
+
+  // 队列化消息处理（确保分块消息按顺序处理）
+  const messageQueue = [];
+  let processingQueue = false;
+
+  function processQueue() {
+    if (processingQueue) return;
+    processingQueue = true;
+    
+    while (messageQueue.length > 0) {
+      const msg = messageQueue.shift();
+      handleMessage(msg);
+    }
+    
+    processingQueue = false;
+  }
+
+  function handleMessage(data) {
+    // 分块消息处理
+    if (data && data.__chunked) {
+      if (data.phase === 'start') {
+        chunkBuffers.set(data.msgId, {
+          chunks: new Array(data.totalChunks),
+          totalChunks: data.totalChunks,
+          originalType: data.originalType
+        });
+        return;
+      }
+      
+      if (data.phase === 'data') {
+        const buf = chunkBuffers.get(data.msgId);
+        if (buf) {
+          buf.chunks[data.chunkIndex] = data.data;
+        }
+        return;
+      }
+      
+      if (data.phase === 'end') {
+        const buf = chunkBuffers.get(data.msgId);
+        if (!buf) return;
+        
+        // 检查是否收齐
+        const receivedCount = buf.chunks.filter(c => c !== undefined).length;
+        if (receivedCount < buf.totalChunks) {
+          console.warn(`[SVR] 分块消息不完整: ${receivedCount}/${buf.totalChunks}, type=${buf.originalType}`);
+          chunkBuffers.delete(data.msgId);
+          return;
+        }
+        
+        // 重组
+        let json = '';
+        for (let i = 0; i < buf.totalChunks; i++) {
+          json += buf.chunks[i];
+        }
+        chunkBuffers.delete(data.msgId);
+        
+        // 解析并处理
+        try {
+          const fullData = JSON.parse(json);
+          if (!ws._chunkLogTime || Date.now() - ws._chunkLogTime >= 5000) {
+            console.log(`[SVR] 分块重组完成: ${buf.originalType}, ${buf.totalChunks}块, ${(json.length/1024).toFixed(1)}KB`);
+            ws._chunkLogTime = Date.now();
+          }
+          dispatchMessage(fullData);
+        } catch (e) {
+          console.error('[SVR] 重组后JSON解析失败:', e.message);
+        }
+        return;
+      }
+    }
+    
+    // 普通消息直接处理
+    dispatchMessage(data);
+  }
+
+  // 注册消息监听器
   ws.on('message', (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch (e) {
@@ -263,6 +341,12 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // 分块消息和普通消息统一走队列
+    messageQueue.push(data);
+    processQueue();
+  });
+
+  function dispatchMessage(data) {
     switch (data.type) {
       case 'register-device-name': {
         // 客户端上报自己的主机名
@@ -369,10 +453,14 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'disconnect':
-        endSession(mySessionId);
+        endSession(mySessionId || ws.mySessionId);
         break;
 
       case 'to-peer': {
+        // 同步 ws.mySessionId 到闭包变量（connect-device 时只在对方连接上设置了 ws.mySessionId）
+        if (!mySessionId && ws.mySessionId) {
+          mySessionId = ws.mySessionId;
+        }
         // 查找会话 - 优先用 mySessionId，回退用 myDeviceCode 搜索
         let sess = null;
         let effectiveSessionId = mySessionId;
@@ -421,23 +509,58 @@ wss.on('connection', (ws, req) => {
           // 序列化并检查大小
           const serialized = JSON.stringify(forwardMsg);
           const msgSizeKB = Math.round(serialized.length / 1024);
+          const MAX_CHUNK = 12 * 1024; // 12KB 每块
           
-          // 记录大消息警告
-          if (msgSizeKB > 500) {
-            console.warn(`[SVR] 转发大消息: type=${payloadType}, size=${msgSizeKB}KB, peer=${formatCode(peerCode)}`);
-          }
-          
-          // 发送
-          try {
-            peer.ws.send(serialized, (err) => {
-              if (err) {
-                console.error(`[SVR] 转发失败: type=${payloadType}, error=${err.message}`);
-              }
-            });
+          // 转发时也分块（避免隧道截断）
+          const forwardChunk = (wsConn, jsonStr) => {
+            if (jsonStr.length <= MAX_CHUNK) {
+              wsConn.send(jsonStr);
+              return { chunks: 1, size: jsonStr.length };
+            }
             
-            // 每10秒打印一次转发状态（用于调试）
-            if (!wss._forwardLogTime || Date.now() - wss._forwardLogTime >= 10000) {
-              console.log(`[SVR] 转发消息: type=${payloadType}, size=${msgSizeKB}KB, 到=${formatCode(peerCode)}`);
+            const fwdMsgId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+            const totalChunks = Math.ceil(jsonStr.length / MAX_CHUNK);
+            
+            // 发送起始标记
+            wsConn.send(JSON.stringify({
+              __server_chunked: true,
+              phase: 'start',
+              msgId: fwdMsgId,
+              totalChunks,
+              originalType: payloadType
+            }));
+            
+            // 发送数据块
+            for (let i = 0; i < totalChunks; i++) {
+              const start = i * MAX_CHUNK;
+              const end = Math.min(start + MAX_CHUNK, jsonStr.length);
+              wsConn.send(JSON.stringify({
+                __server_chunked: true,
+                phase: 'data',
+                msgId: fwdMsgId,
+                chunkIndex: i,
+                data: jsonStr.substring(start, end)
+              }));
+            }
+            
+            // 发送结束标记
+            wsConn.send(JSON.stringify({
+              __server_chunked: true,
+              phase: 'end',
+              msgId: fwdMsgId
+            }));
+            
+            return { chunks: totalChunks, size: jsonStr.length };
+          };
+          
+          // 执行转发
+          try {
+            const result = forwardChunk(peer.ws, serialized);
+            
+            // 打印转发状态
+            const logPrefix = result.chunks > 1 ? `分块${result.chunks}块` : '直传';
+            if (!wss._forwardLogTime || Date.now() - wss._forwardLogTime >= 5000) {
+              console.log(`[SVR] 转发(${logPrefix}): type=${payloadType}, size=${msgSizeKB}KB, 到=${formatCode(peerCode)}`);
               wss._forwardLogTime = Date.now();
             }
           } catch (sendErr) {
@@ -455,12 +578,15 @@ wss.on('connection', (ws, req) => {
       default:
         break;
     }
-  });
+  }
 
   ws.on('close', () => {
     clearInterval(heartbeatTimer);
     console.log(`[SVR] 连接关闭 client=${clientId}`);
-    if (mySessionId) endSession(mySessionId);
+    // 关键：被控端的 mySessionId 只存在于 ws.mySessionId 上（闭包变量未设置），
+    // 必须两者都检查，否则被控端断开时不会结束会话，主控端无从得知
+    const sid = mySessionId || ws.mySessionId;
+    if (sid) endSession(sid);
     if (myDeviceCode) devices.delete(myDeviceCode);
     clientToDevice.delete(clientId);
   });

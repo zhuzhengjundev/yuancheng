@@ -273,6 +273,13 @@ function connectServer() {
   sock.on('message', (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch (e) { return; }
+    
+    // 处理服务端分块转发消息（__server_chunked）
+    if (data && data.__server_chunked) {
+      handleServerChunkedMessage(data);
+      return;
+    }
+    
     handleServerMessage(data);
   });
 
@@ -311,18 +318,127 @@ function scheduleReconnect(delay = 3000) {
   }, delay);
 }
 
+// 分块传输：避免隧道服务截断大消息
+const WS_MAX_CHUNK = 12 * 1024; // 12KB 每块（隧道服务通常限制~32KB）
+let wsChunkCounter = 0;
+
 function sendToServer(data) {
-  if (ws && serverConnected && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
-    return true;
+  if (!ws || serverConnected !== true || ws.readyState !== WebSocket.OPEN) {
+    if (!ws || !serverConnected) return false;
   }
-  return false;
+  
+  try {
+    const json = JSON.stringify(data);
+    
+    // 小消息直接发送
+    if (json.length <= WS_MAX_CHUNK) {
+      ws.send(json);
+      return true;
+    }
+    
+    // 大消息分块发送
+    const msgId = ++wsChunkCounter;
+    const totalChunks = Math.ceil(json.length / WS_MAX_CHUNK);
+    const originalType = data.type || 'unknown';
+    
+    // 发送起始标记
+    ws.send(JSON.stringify({
+      __chunked: true,
+      phase: 'start',
+      msgId,
+      totalChunks,
+      originalType
+    }));
+    
+    // 发送数据块
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * WS_MAX_CHUNK;
+      const end = Math.min(start + WS_MAX_CHUNK, json.length);
+      ws.send(JSON.stringify({
+        __chunked: true,
+        phase: 'data',
+        msgId,
+        chunkIndex: i,
+        data: json.substring(start, end)
+      }));
+    }
+    
+    // 发送结束标记
+    ws.send(JSON.stringify({
+      __chunked: true,
+      phase: 'end',
+      msgId
+    }));
+    
+    if (!sendToServer._chunkLog || Date.now() - sendToServer._chunkLog >= 5000) {
+      console.log(`[WS] 分块发送: ${originalType}, ${totalChunks}块, 总${(json.length/1024).toFixed(1)}KB`);
+      sendToServer._chunkLog = Date.now();
+    }
+    return true;
+  } catch (e) {
+    console.error('[WS] sendToServer 错误:', e.message);
+    return false;
+  }
 }
 
 // 向对端发送（走服务器转发）
 function sendToPeer(payload) {
   if (!sessionId) return false;
   return sendToServer({ type: 'to-peer', payload });
+}
+
+// ==================== 服务端分块消息重组 ====================
+const serverChunkBuffers = new Map(); // msgId -> { chunks, totalChunks, originalType }
+
+function handleServerChunkedMessage(data) {
+  if (data.phase === 'start') {
+    serverChunkBuffers.set(data.msgId, {
+      chunks: new Array(data.totalChunks),
+      totalChunks: data.totalChunks,
+      originalType: data.originalType
+    });
+    return;
+  }
+  
+  if (data.phase === 'data') {
+    const buf = serverChunkBuffers.get(data.msgId);
+    if (buf) {
+      buf.chunks[data.chunkIndex] = data.data;
+    }
+    return;
+  }
+  
+  if (data.phase === 'end') {
+    const buf = serverChunkBuffers.get(data.msgId);
+    if (!buf) return;
+    
+    // 检查是否收齐
+    const receivedCount = buf.chunks.filter(c => c !== undefined).length;
+    if (receivedCount < buf.totalChunks) {
+      console.warn(`[WS-CLIENT] 服务端分块消息不完整: ${receivedCount}/${buf.totalChunks}, type=${buf.originalType}`);
+      serverChunkBuffers.delete(data.msgId);
+      return;
+    }
+    
+    // 重组
+    let json = '';
+    for (let i = 0; i < buf.totalChunks; i++) {
+      json += buf.chunks[i];
+    }
+    serverChunkBuffers.delete(data.msgId);
+    
+    // 解析并处理
+    try {
+      const fullData = JSON.parse(json);
+      if (!handleServerChunkedMessage._logTime || Date.now() - handleServerChunkedMessage._logTime >= 5000) {
+        console.log(`[WS-CLIENT] 重组完成: ${buf.originalType}, ${buf.totalChunks}块, ${(json.length/1024).toFixed(1)}KB`);
+        handleServerChunkedMessage._logTime = Date.now();
+      }
+      handleServerMessage(fullData);
+    } catch (e) {
+      console.error('[WS-CLIENT] 重组后JSON解析失败:', e.message);
+    }
+  }
 }
 
 // ==================== 服务端消息处理 ====================
