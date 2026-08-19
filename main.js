@@ -631,48 +631,35 @@ function handlePeerMessage(payload, fromRole) {
       }
       
       const imageData = payload.image;
-      
-      // ====== 方案1: 旧格式直接发送（兼容旧版 control.html） ======
-      // 对于小于 200KB 的帧，直接用旧格式发送
-      // 对于较大的帧，也发送旧格式作为备用
-      try {
-        controlWindow.webContents.send('screen-frame', {
-          image: payload.image,
-          width: payload.width,
-          height: payload.height
-        });
-      } catch (e) {
-        console.warn('[Controller] 旧格式发送失败:', e.message);
-      }
-      
-      // ====== 方案2: 分块传输（用于大帧） ======
-      if (imageData.length > 50 * 1024) {
-        const CHUNK_SIZE = 8192; // 每块 8KB
-        const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
-        const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-        
-        // 先发送帧头信息
-        controlWindow.webContents.send('screen-frame-header', {
+
+      // ====== 全部走分块 IPC 传输 ======
+      // 完整大帧经 webContents.send 会被 Electron 静默截断，
+      // 因此不分帧大小，统一拆成 8KB 块发送，由渲染进程重组
+      const CHUNK_SIZE = 8192; // 每块 8KB
+      const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
+      const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+
+      // 先发送帧头信息
+      controlWindow.webContents.send('screen-frame-header', {
+        frameId,
+        width: payload.width,
+        height: payload.height,
+        totalChunks,
+        imageSize: imageData.length
+      });
+
+      // 分块发送
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, imageData.length);
+        const chunk = imageData.substring(start, end);
+
+        controlWindow.webContents.send('screen-frame-chunk', {
           frameId,
-          width: payload.width,
-          height: payload.height,
+          chunkIndex: i,
           totalChunks,
-          imageSize: imageData.length
+          data: chunk
         });
-        
-        // 分块发送
-        for (let i = 0; i < totalChunks; i++) {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, imageData.length);
-          const chunk = imageData.substring(start, end);
-          
-          controlWindow.webContents.send('screen-frame-chunk', {
-            frameId,
-            chunkIndex: i,
-            totalChunks,
-            data: chunk
-          });
-        }
       }
       
       // 每5秒打印一次状态
