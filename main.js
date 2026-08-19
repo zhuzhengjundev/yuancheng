@@ -514,39 +514,55 @@ function handlePeerMessage(payload, fromRole) {
         console.log('[Controller] ========== 首次收到屏幕帧 ==========');
       }
       
-      // 分块传输方案：将大图像分成小块发送
-      const CHUNK_SIZE = 8192; // 每块 8KB
       const imageData = payload.image;
-      const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
-      const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
       
-      // 先发送帧头信息
-      controlWindow.webContents.send('screen-frame-header', {
-        frameId,
-        width: payload.width,
-        height: payload.height,
-        totalChunks,
-        imageSize: imageData.length
-      });
-      
-      // 分块发送
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, imageData.length);
-        const chunk = imageData.substring(start, end);
-        
-        controlWindow.webContents.send('screen-frame-chunk', {
-          frameId,
-          chunkIndex: i,
-          totalChunks,
-          data: chunk
+      // ====== 方案1: 旧格式直接发送（兼容旧版 control.html） ======
+      // 对于小于 200KB 的帧，直接用旧格式发送
+      // 对于较大的帧，也发送旧格式作为备用
+      try {
+        controlWindow.webContents.send('screen-frame', {
+          image: payload.image,
+          width: payload.width,
+          height: payload.height
         });
+      } catch (e) {
+        console.warn('[Controller] 旧格式发送失败:', e.message);
+      }
+      
+      // ====== 方案2: 分块传输（用于大帧） ======
+      if (imageData.length > 50 * 1024) {
+        const CHUNK_SIZE = 8192; // 每块 8KB
+        const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
+        const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        
+        // 先发送帧头信息
+        controlWindow.webContents.send('screen-frame-header', {
+          frameId,
+          width: payload.width,
+          height: payload.height,
+          totalChunks,
+          imageSize: imageData.length
+        });
+        
+        // 分块发送
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, imageData.length);
+          const chunk = imageData.substring(start, end);
+          
+          controlWindow.webContents.send('screen-frame-chunk', {
+            frameId,
+            chunkIndex: i,
+            totalChunks,
+            data: chunk
+          });
+        }
       }
       
       // 每5秒打印一次状态
       if (!handlePeerMessage._frameLogTime || Date.now() - handlePeerMessage._frameLogTime >= 5000) {
         const frameSizeKB = (imageData.length * 3 / 4 / 1024).toFixed(1);
-        console.log(`[Controller] 屏幕帧已分块发送: ${frameSizeKB}KB, ${payload.width}x${payload.height}, ${totalChunks}块`);
+        console.log(`[Controller] 屏幕帧发送: ${frameSizeKB}KB, ${payload.width}x${payload.height}`);
         handlePeerMessage._frameLogTime = Date.now();
       }
       break;

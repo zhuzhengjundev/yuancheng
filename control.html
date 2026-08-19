@@ -69,6 +69,21 @@
     .placeholder { color: #666; font-size: 15px; text-align: center; }
     .placeholder svg { width: 80px; height: 80px; margin-bottom: 16px; opacity: 0.5; }
     .hidden { display: none !important; }
+    
+    /* 调试信息 */
+    .debug-info { margin-top: 20px; font-size: 13px; color: #888; line-height: 1.6; }
+    .debug-sub { font-size: 11px; color: #555; margin-top: 8px; }
+    .debug-panel {
+      position: fixed; bottom: 10px; left: 10px;
+      background: rgba(0,0,0,0.75); color: #0f0; font-family: Consolas, Monaco, monospace;
+      font-size: 11px; padding: 8px 12px; border-radius: 6px;
+      border: 1px solid rgba(0,255,0,0.3); z-index: 50;
+      min-width: 180px; display: none;
+    }
+    .debug-panel.show { display: block; }
+    .debug-row { display: flex; justify-content: space-between; gap: 12px; margin: 2px 0; }
+    .debug-row span:first-child { color: #888; }
+    .debug-row span:last-child { color: #0f0; }
 
     /* 剪贴板弹窗 */
     .clipboard-modal {
@@ -168,8 +183,21 @@
         <line x1="12" y1="17" x2="12" y2="21"/>
       </svg>
       <div>正在等待远程画面...</div>
+      <div class="debug-info" id="debugInfo">
+        <div>📡 等待屏幕帧中...</div>
+        <div class="debug-sub">如果长时间无画面，请打开开发者工具查看日志</div>
+      </div>
     </div>
     <img id="screen" class="hidden" alt="远程屏幕">
+    <!-- 调试面板 -->
+    <div class="debug-panel" id="debugPanel">
+      <div class="debug-row"><span>状态:</span> <span id="dbgStatus">等待中</span></div>
+      <div class="debug-row"><span>帧头:</span> <span id="dbgHeader">0</span></div>
+      <div class="debug-row"><span>数据块:</span> <span id="dbgChunks">0/0</span></div>
+      <div class="debug-row"><span>已组装:</span> <span id="dbgAssembled">0</span></div>
+      <div class="debug-row"><span>旧格式帧:</span> <span id="dbgOldFormat">0</span></div>
+      <div class="debug-row"><span>分辨率:</span> <span id="dbgResolution">-</span></div>
+    </div>
   </div>
 
   <!-- 剪贴板弹窗 -->
@@ -202,6 +230,38 @@
     console.log('[Control] remoteAPI 可用:', !!api);
     console.log('[Control] onScreenFrameHeader 可用:', !!api.onScreenFrameHeader);
     console.log('[Control] onScreenFrameChunk 可用:', !!api.onScreenFrameChunk);
+    console.log('[Control] onScreenFrame (旧格式) 可用:', !!api.onScreenFrame);
+
+    // ====== 调试面板 ======
+    const dbg = {
+      headerCount: 0,
+      chunkReceived: 0,
+      chunkTotal: 0,
+      assembledCount: 0,
+      oldFormatCount: 0,
+      lastResolution: '-',
+      lastUpdate: 0
+    };
+    
+    function updateDebugPanel(force) {
+      const now = Date.now();
+      if (!force && now - dbg.lastUpdate < 200) return; // 限频200ms
+      dbg.lastUpdate = now;
+      
+      const panel = $('debugPanel');
+      if (!panel) return;
+      panel.classList.add('show');
+      
+      $('dbgStatus').textContent = totalFrames > 0 ? '✅ 传输中' : '⏳ 等待中';
+      $('dbgHeader').textContent = dbg.headerCount;
+      $('dbgChunks').textContent = `${dbg.chunkReceived}/${dbg.chunkTotal}`;
+      $('dbgAssembled').textContent = dbg.assembledCount;
+      $('dbgOldFormat').textContent = dbg.oldFormatCount;
+      $('dbgResolution').textContent = dbg.lastResolution;
+    }
+    
+    // 每秒强制更新一次
+    setInterval(() => updateDebugPanel(true), 1000);
 
     // ====== FPS 计算 ======
     let frameCount = 0;
@@ -244,6 +304,10 @@
       // 清理当前帧（立即释放内存）
       const frameId = currentFrame.frameId;
       currentFrame = null;
+      
+      // 更新调试
+      dbg.assembledCount++;
+      updateDebugPanel();
       
       // 渲染图像
       totalFrames++;
@@ -294,6 +358,11 @@
         return;
       }
       
+      dbg.headerCount++;
+      dbg.chunkTotal = header.totalChunks;
+      dbg.lastResolution = `${header.width}x${header.height}`;
+      updateDebugPanel();
+      
       // 丢弃旧帧（如果接收时间过长）
       if (currentFrame && currentFrame.frameId !== header.frameId) {
         const age = Date.now() - (currentFrame.startTime || 0);
@@ -335,8 +404,12 @@
       // 存储块
       currentFrame.chunks[chunk.chunkIndex] = chunk.data;
       
-      // 检查是否收齐
+      // 更新调试
       const receivedCount = currentFrame.chunks.filter(c => c !== undefined).length;
+      dbg.chunkReceived = receivedCount;
+      updateDebugPanel();
+      
+      // 检查是否收齐
       if (receivedCount >= currentFrame.totalChunks) {
         renderAssembledFrame();
       }
@@ -346,6 +419,10 @@
     api.onScreenFrame(({ image, width, height }) => {
       if (!image) return;
       
+      dbg.oldFormatCount++;
+      dbg.lastResolution = `${width}x${height}`;
+      updateDebugPanel();
+      
       totalFrames++;
       frameCount++;
       lastFrameReceiveTime = performance.now();
@@ -354,6 +431,7 @@
       if (totalFrames === 1) {
         console.log('[Control] ========== 收到第一帧 (旧格式) ==========');
         $('fpsDisplay').textContent = '画面传输中';
+        $('debugInfo').style.display = 'none';
       }
       
       if (now - lastFrameTime >= 5000) {
