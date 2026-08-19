@@ -192,6 +192,9 @@
     <!-- 调试面板 -->
     <div class="debug-panel" id="debugPanel">
       <div class="debug-row"><span>状态:</span> <span id="dbgStatus">等待中</span></div>
+      <div class="debug-row"><span>主进程帧:</span> <span id="dbgProcFrames">0</span></div>
+      <div class="debug-row"><span>主进程块:</span> <span id="dbgProcChunks">0</span></div>
+      <div class="debug-row"><span>空帧丢弃:</span> <span id="dbgEmpty">0</span></div>
       <div class="debug-row"><span>帧头:</span> <span id="dbgHeader">0</span></div>
       <div class="debug-row"><span>数据块:</span> <span id="dbgChunks">0/0</span></div>
       <div class="debug-row"><span>已组装:</span> <span id="dbgAssembled">0</span></div>
@@ -258,6 +261,22 @@
       $('dbgAssembled').textContent = dbg.assembledCount;
       $('dbgOldFormat').textContent = dbg.oldFormatCount;
       $('dbgResolution').textContent = dbg.lastResolution;
+      $('dbgProcFrames').textContent = `${diagProc.frames} (${diagProc.sizeKB}KB)`;
+      $('dbgProcChunks').textContent = diagProc.chunks;
+      $('dbgEmpty').textContent = diagProc.empty;
+    }
+
+    // 主进程诊断数据（来自 main.js 的 diag-stats）
+    const diagProc = { frames: 0, chunks: 0, sizeKB: '0.0', empty: 0 };
+    if (api.onDiagStats) {
+      api.onDiagStats((d) => {
+        if (!d) return;
+        diagProc.frames = d.framesReceived || 0;
+        diagProc.chunks = d.chunksSent || 0;
+        diagProc.sizeKB = d.framesSizeKB || '0.0';
+        diagProc.empty = d.emptyFrames || 0;
+        updateDebugPanel(true);
+      });
     }
     
     // 每秒强制更新一次
@@ -282,6 +301,10 @@
     // ====== 分块接收与重组 ======
     // 当前正在接收的帧数据
     let currentFrame = null; // { frameId, width, height, totalChunks, chunks: [], received: Set }
+    
+    // 实际屏幕分辨率（用于鼠标坐标映射）
+    let realScreenWidth = 1920;
+    let realScreenHeight = 1080;
     
     function renderAssembledFrame() {
       if (!currentFrame) return;
@@ -362,6 +385,11 @@
       dbg.headerCount++;
       dbg.chunkTotal = header.totalChunks;
       dbg.lastResolution = `${header.width}x${header.height}`;
+      // 保存实际屏幕分辨率（用于坐标映射）
+      if (header.screenWidth && header.screenHeight) {
+        realScreenWidth = header.screenWidth;
+        realScreenHeight = header.screenHeight;
+      }
       updateDebugPanel();
       
       // 丢弃旧帧（如果接收时间过长）
@@ -417,11 +445,16 @@
     });
     
     // 兼容旧格式（完整帧一次性发送）
-    api.onScreenFrame(({ image, width, height }) => {
+    api.onScreenFrame(({ image, width, height, screenWidth, screenHeight }) => {
       if (!image) return;
       
       dbg.oldFormatCount++;
       dbg.lastResolution = `${width}x${height}`;
+      // 保存实际屏幕分辨率
+      if (screenWidth && screenHeight) {
+        realScreenWidth = screenWidth;
+        realScreenHeight = screenHeight;
+      }
       updateDebugPanel();
       
       totalFrames++;
@@ -473,9 +506,13 @@
     function getRelativeCoords(e) {
       const img = $('screen');
       const rect = img.getBoundingClientRect();
-      const x = (e.clientX - rect.left) / rect.width;
-      const y = (e.clientY - rect.top) / rect.height;
-      return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+      // 先算相对坐标（0-1）
+      const relX = (e.clientX - rect.left) / rect.width;
+      const relY = (e.clientY - rect.top) / rect.height;
+      // 转换成实际屏幕坐标
+      const x = Math.round(Math.min(realScreenWidth, Math.max(0, relX * realScreenWidth)));
+      const y = Math.round(Math.min(realScreenHeight, Math.max(0, relY * realScreenHeight)));
+      return { x, y };
     }
 
     function sendCmd(command, params) {

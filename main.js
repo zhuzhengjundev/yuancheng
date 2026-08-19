@@ -11,6 +11,24 @@
  *   - 被控端：开始推屏幕，收到命令后通过 win-robot 执行
  */
 
+// ============ 全局错误捕获（写入日志文件，排查白屏用） ============
+const diagLogPath = require('path').join(require('os').tmpdir(), 'remotecontrol-crash.log');
+function logCrash(msg) {
+  try {
+    const fs = require('fs');
+    const ts = new Date().toISOString();
+    fs.appendFileSync(diagLogPath, `[${ts}] ${msg}\n`);
+    console.error('[CRASH-LOG]', msg);
+  } catch (_) {}
+}
+process.on('uncaughtException', (e) => {
+  logCrash('uncaughtException: ' + e.message + '\n' + e.stack);
+});
+process.on('unhandledRejection', (e) => {
+  logCrash('unhandledRejection: ' + (e ? (e.message || String(e)) : 'unknown'));
+});
+logCrash('主进程开始加载...');
+
 const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard, systemPreferences, shell } = require('electron');
 const path = require('path');
 const os = require('os');
@@ -18,8 +36,15 @@ const fs = require('fs');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 
+// 禁用硬件加速（解决 Windows 白屏/GPU 崩溃问题）
+app.disableHardwareAcceleration();
+logCrash('硬件加速已禁用');
+
+logCrash('Electron 模块已加载');
+
 // ============ 配置文件（读写 WS 地址、clientId 等） ============
-const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+// 注意：app.getPath('userData') 在 app ready 前调用可能返回空路径
+let CONFIG_PATH = '';
 
 function loadConfig() {
   try {
@@ -122,6 +147,39 @@ let sessionId = null;
 let myRole = null;       // 'controller' | 'controlled'
 let peerCode = null;
 let frameEverReceived = false; // 主控端是否曾收到过帧
+let diagStats = { framesReceived: 0, emptyFrames: 0, framesSizeKB: '0.0', headersSent: 0, chunksSent: 0, lastFrameTime: 0 }; // 主控端链路诊断
+let lastCaptureSizeKB = '0.0'; // 被控端最近一帧大小
+let remoteCmdReceived = 0;     // 被控端收到的键鼠命令数
+let lastCaptureError = '';    // 被控端最近一次捕获失败详情
+let captureSendFailCount = 0;  // 被控端帧发送失败计数
+let captureSendFailLog = 0;    // 发送失败日志限频
+let robotLoadError = '';      // 被控端 win-robot 加载错误详情
+let _winRobot = null;        // 键鼠控制模块（提前声明避免 TDZ 白屏）
+
+// 诊断推送：把主进程状态实时显示到界面上（打包后无控制台，排查全靠这个）
+setInterval(() => {
+  try {
+    if (myRole === 'controller' && controlWindow && !controlWindow.isDestroyed()) {
+      controlWindow.webContents.send('diag-stats', diagStats);
+    }
+    if (myRole === 'controlled' && sessionId && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('capture-stats', {
+        frames: captureFrameCount,
+        fails: captureFailCount,
+        running: captureTimer != null,
+        lastSizeKB: lastCaptureSizeKB,
+        error: lastCaptureError
+      });
+      const r = _winRobot;
+      mainWindow.webContents.send('robot-status', {
+        loaded: !!r,
+        ready: !!(r && r.isReady && r.isReady()),
+        cmds: remoteCmdReceived,
+        error: robotLoadError
+      });
+    }
+  } catch (e) {}
+}, 1000);
 
 // 屏幕捕获
 let captureTimer = null;
@@ -131,6 +189,7 @@ let captureFailCount = 0;
 
 // ==================== 窗口 ====================
 function createMainWindow(page) {
+  logCrash('createMainWindow: ' + page);
   mainWindow = new BrowserWindow({
     width: 480,
     height: 820,
@@ -145,12 +204,36 @@ function createMainWindow(page) {
   });
 
   mainWindow.setMenuBarVisibility(false);
+  
+  // 渲染进程 console 转发到日志（排查白屏）
+  mainWindow.webContents.on('console-message', (_level, msg, line, source) => {
+    logCrash(`[Renderer] ${msg} (${source}:${line})`);
+  });
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    logCrash(`渲染进程崩溃: ${details.reason}`);
+  });
+  
+  // 强制打开 DevTools（排查白屏用）
+  mainWindow.webContents.once('did-finish-load', () => {
+    logCrash('主窗口加载完成: ' + page);
+    logCrash('准备打开 DevTools...');
+    try {
+      mainWindow.webContents.openDevTools({ mode: 'detach' });
+    } catch (e) {
+      logCrash('打开 DevTools 失败: ' + e.message);
+    }
+  });
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
+    logCrash('主窗口加载失败: ' + code + ' ' + desc);
+  });
 
   if (page === 'setup') {
     const saved = getSavedWsUrl();
     const mode = saved ? 'expired' : 'first';
+    logCrash('加载 setup.html, mode=' + mode);
     mainWindow.loadFile('setup.html', { query: { mode } });
   } else {
+    logCrash('加载 index.html');
     mainWindow.loadFile('index.html');
   }
 
@@ -181,6 +264,22 @@ function createControlWindow() {
   });
   controlWindow.setMenuBarVisibility(false);
   controlWindow.loadFile('control.html');
+
+  // 强制支持 F12 / Ctrl+Shift+I 打开开发者工具（菜单栏隐藏后系统快捷键会失效）
+  controlWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown') {
+      if (input.key === 'F12' ||
+          (input.control && input.shift && (input.key.toLowerCase() === 'i' || input.key.toLowerCase() === 'j'))) {
+        controlWindow.webContents.toggleDevTools();
+        event.preventDefault();
+      }
+      // Ctrl+R 刷新（调试用）
+      if (input.control && input.key.toLowerCase() === 'r') {
+        controlWindow.webContents.reload();
+        event.preventDefault();
+      }
+    }
+  });
   
   // 窗口加载完成后通知被控端开始推屏
   controlWindow.webContents.once('did-finish-load', () => {
@@ -564,6 +663,9 @@ function cleanupSession(disconnected) {
   captureWarningShown = false;
   captureFrameCount = 0;
   lastCaptureTime = 0;
+  lastCaptureError = '';
+  captureSendFailCount = 0;
+  remoteCmdReceived = 0;
   if (controlWindow) {
     controlWindow.webContents.send('session-ended');
     // 主控端关闭窗口；被控端不关闭（它可能没打开）
@@ -610,7 +712,8 @@ function handlePeerMessage(payload, fromRole) {
     }
     case 'screen-frame': {
       if (!payload.image) {
-        console.warn('[Peer] 收到空的 screen-frame');
+        diagStats.emptyFrames++;
+        console.warn('[Peer] 收到空的 screen-frame（被控端捕获失败或权限问题）');
         break;
       }
       
@@ -639,11 +742,13 @@ function handlePeerMessage(payload, fromRole) {
       const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
       const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 
-      // 先发送帧头信息
+      // 先发送帧头信息（包含实际屏幕分辨率）
       controlWindow.webContents.send('screen-frame-header', {
         frameId,
         width: payload.width,
         height: payload.height,
+        screenWidth: payload.screenWidth || payload.width,
+        screenHeight: payload.screenHeight || payload.height,
         totalChunks,
         imageSize: imageData.length
       });
@@ -662,6 +767,13 @@ function handlePeerMessage(payload, fromRole) {
         });
       }
       
+      // 主控端链路诊断统计（推送给控制窗口调试面板）
+      diagStats.framesReceived++;
+      diagStats.framesSizeKB = (imageData.length * 3 / 4 / 1024).toFixed(1);
+      diagStats.headersSent++;
+      diagStats.chunksSent += totalChunks;
+      diagStats.lastFrameTime = Date.now();
+
       // 每5秒打印一次状态
       if (!handlePeerMessage._frameLogTime || Date.now() - handlePeerMessage._frameLogTime >= 5000) {
         const frameSizeKB = (imageData.length * 3 / 4 / 1024).toFixed(1);
@@ -673,6 +785,7 @@ function handlePeerMessage(payload, fromRole) {
     case 'remote-command': {
       // 来自主控的键鼠命令 —— 只有被控执行
       if (myRole === 'controlled') {
+        remoteCmdReceived++;
         handleRemoteCommand(payload.command, payload.params || {});
       }
       break;
@@ -755,16 +868,16 @@ function startScreenCapture() {
   const { width, height } = primaryDisplay.workAreaSize;
   console.log(`[Capture] 屏幕分辨率: ${width}x${height}, 可用工作区: ${primaryDisplay.workAreaSize.width}x${primaryDisplay.workAreaSize.height}`);
 
-  // 计算缩略图尺寸 - 目标最大宽度960px，保持宽高比
-  const MAX_WIDTH = 960;
-  let thumbWidth = Math.floor(width * 0.4);
-  let thumbHeight = Math.floor(height * 0.4);
+  // 使用原始分辨率捕获，但限制最大宽度以控制传输大小
+  const MAX_WIDTH = 1920;
+  let thumbWidth = width;
+  let thumbHeight = height;
   if (thumbWidth > MAX_WIDTH) {
     const ratio = MAX_WIDTH / thumbWidth;
     thumbWidth = MAX_WIDTH;
     thumbHeight = Math.floor(thumbHeight * ratio);
   }
-  console.log(`[Capture] 缩略图尺寸: ${thumbWidth}x${thumbHeight}`);
+  console.log(`[Capture] 捕获尺寸: ${thumbWidth}x${thumbHeight} (原始: ${width}x${height})`);
 
   // 立即执行一次捕获
   const captureOnce = async () => {
@@ -774,6 +887,7 @@ function startScreenCapture() {
       return;
     }
     try {
+      logCrash(`[Capture] 开始捕获: sessionId=${sessionId}, role=${myRole}, size=${thumbWidth}x${thumbHeight}`);
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
         thumbnailSize: {
@@ -781,14 +895,76 @@ function startScreenCapture() {
           height: thumbHeight
         }
       });
+      logCrash(`[Capture] getSources 返回 ${sources.length} 个源`);
+      sources.forEach((s, i) => {
+        const t = s.thumbnail;
+        let info = 'null';
+        if (t) {
+          try {
+            const sz = t.getSize ? t.getSize() : { width: t.getWidth(), height: t.getHeight() };
+            info = `${sz.width}x${sz.height}, empty=${t.isEmpty()}`;
+          } catch (e) {
+            info = 'error:' + e.message;
+          }
+        }
+        logCrash(`[Capture] 源${i}: name=${s.display_id || s.name}, ${info}`);
+      });
 
-      if (sources.length > 0 && sources[0].thumbnail) {
-        captureFailCount = 0;
-        const thumb = sources[0].thumbnail;
-        // 使用较低的JPEG质量以减小体积
-        const jpeg = thumb.toJPEG(40);
-        const base64 = jpeg.toString('base64');
-        const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
+      // 统一的捕获失败处理（区分失败原因）
+      const captureFailed = (reason, detail) => {
+        captureFailCount++;
+        lastCaptureError = (detail || reason).toString().substring(0, 120);
+        logCrash(`[Capture] 捕获失败 #${captureFailCount}: reason=${reason}, detail=${lastCaptureError}`);
+        if (captureFailCount <= 3 || captureFailCount % 20 === 0) {
+          console.warn(`[Capture] 失败(${reason}) 连续第${captureFailCount}次`, detail || '');
+        }
+        if (captureFailCount >= 3 && !captureWarningShown) {
+          captureWarningShown = true;
+          const msgs = {
+            'no-sources': '无可用屏幕源，请检查屏幕录制权限',
+            'empty-thumbnail': '捕获到空画面：macOS 需在 系统设置>隐私与安全性>屏幕录制 中勾选本应用，然后【完全退出并重新打开】',
+            'empty-jpeg': '画面编码为空：通常是屏幕录制权限未生效，请勾选权限后【完全退出并重新打开】本应用'
+          };
+          const reasonKey = reason.startsWith('empty') ? reason : 'no-sources';
+          console.error(`[Capture] ${msgs[reasonKey]}`);
+          notifyCaptureStatus({ ok: false, reason: reasonKey, message: msgs[reasonKey] });
+        }
+      };
+
+      // 找一个非空的屏幕源（多屏时跳过空缩略图的源）
+      const src = sources.find(s => s.thumbnail && !s.thumbnail.isEmpty());
+      if (src) {
+        const sz = src.thumbnail.getSize ? src.thumbnail.getSize() : { width: src.thumbnail.getWidth(), height: src.thumbnail.getHeight() };
+        logCrash(`[Capture] find结果: ${src.display_id} ${sz.width}x${sz.height}`);
+      } else {
+        logCrash(`[Capture] find结果: 无可用源`);
+      }
+
+      if (!src) {
+        if (sources.length === 0) {
+          captureFailed('no-sources', 'desktopCapturer 返回 0 个屏幕源');
+        } else {
+          captureFailed('empty-thumbnail', `共${sources.length}个源，但所有缩略图均为空`);
+        }
+        return;
+      }
+
+      captureFailCount = 0;
+      const thumb = src.thumbnail;
+      // 获取尺寸（兼容 Texture 和 NativeImage）
+      const thumbSz = thumb.getSize ? thumb.getSize() : { width: thumb.getWidth(), height: thumb.getHeight() };
+      // 使用高JPEG质量以保证清晰度
+      const jpeg = thumb.toJPEG(80);
+      if (!jpeg || jpeg.length === 0) {
+        captureFailed('empty-jpeg', `toJPEG 返回空 buffer`);
+        return;
+      }
+      // 成功捕获，清除错误
+      lastCaptureError = '';
+      captureFailCount = 0;
+      const base64 = jpeg.toString('base64');
+      const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
+      logCrash(`[Capture] 捕获成功: ${sizeKB}KB ${thumbSz.width}x${thumbSz.height}`);
         
         // 检查帧大小 - 如果太大则跳过
         const MAX_FRAME_SIZE = 500 * 1024; // 500KB
@@ -796,15 +972,30 @@ function startScreenCapture() {
           console.warn(`[Capture] 帧过大: ${sizeKB}KB, 可能导致传输问题`);
         }
         
-        // 发送屏幕帧
+        // 发送屏幕帧（包含实际屏幕分辨率用于坐标映射）
         const sent = sendToPeer({
           type: 'screen-frame',
           image: base64,
-          width: thumb.getWidth(),
-          height: thumb.getHeight()
+          width: thumbSz.width,
+          height: thumbSz.height,
+          screenWidth: width,    // 实际屏幕宽度
+          screenHeight: height   // 实际屏幕高度
         });
+        logCrash(`[Capture] 帧发送结果: ${sent ? '✅成功' : '❌失败'}, size=${sizeKB}KB, WS=${ws ? ws.readyState : 'no-ws'}`);
+        
+        if (!sent) {
+          // 捕获成功但发送失败 — 单独计数
+          captureSendFailCount++;
+          if (!captureSendFailLog || Date.now() - captureSendFailLog >= 3000) {
+            captureSendFailLog = Date.now();
+            lastCaptureError = `发送失败: WS=${ws ? ws.readyState : 'no-ws'} session=${!!sessionId} (已连续${captureSendFailCount}次)`;
+          }
+        } else {
+          captureSendFailCount = 0;
+        }
         
         captureFrameCount++;
+        lastCaptureSizeKB = sizeKB;
         
         // 每5秒打印一次状态
         const now = Date.now();
@@ -818,27 +1009,10 @@ function startScreenCapture() {
           notifyCaptureStatus({ ok: true });
           captureWarningShown = false;
         }
-      } else {
-        // 无可用屏幕源
-        captureFailCount++;
-        if (captureFailCount <= 3 || captureFailCount % 10 === 0) {
-          console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次), sources.length: ${sources.length}`);
-        }
-        if (captureFailCount >= 3 && !captureWarningShown) {
-          console.warn('[Capture] 检测到屏幕捕获失败，可能是权限问题');
-          notifyCaptureStatus({
-            ok: false,
-            reason: 'no-sources',
-            message: '无法捕获屏幕画面，请检查屏幕录制权限'
-          });
-          captureWarningShown = true;
-        }
-      }
     } catch (e) {
       captureFailCount++;
-      if (captureFailCount <= 3 || captureFailCount % 10 === 0) {
-        console.error('[Capture] 错误:', e.message);
-      }
+      lastCaptureError = (e.message || String(e)).toString().substring(0, 120);
+      logCrash(`[Capture] 异常 #${captureFailCount}: ${lastCaptureError}`);
       if (captureFailCount >= 3 && !captureWarningShown) {
         notifyCaptureStatus({
           ok: false,
@@ -868,13 +1042,17 @@ function stopScreenCapture() {
 }
 
 // ==================== 键鼠控制（被控端执行） ====================
-let _winRobot = null;
 function getWinRobot() {
   if (_winRobot) return _winRobot;
   try {
     _winRobot = require('./win-robot');
-    _winRobot.init().catch(e => console.warn('[Robot] init err:', e.message));
+    robotLoadError = '';
+    _winRobot.init().catch(e => {
+      robotLoadError = '初始化超时: ' + e.message;
+      console.warn('[Robot] init err:', e.message);
+    });
   } catch (e) {
+    robotLoadError = 'require 失败: ' + e.message;
     console.error('[Robot] 加载失败:', e.message);
     _winRobot = null;
   }
@@ -893,7 +1071,20 @@ async function handleRemoteCommand(command, params) {
     return;
   }
   const r = getWinRobot();
-  if (!r) return;
+  if (!r) {
+    // 键鼠模块加载失败 —— 明确通知（之前静默返回导致"控制不了"无任何提示）
+    if (!handleRemoteCommand._robotErrTime || Date.now() - handleRemoteCommand._robotErrTime >= 10000) {
+      handleRemoteCommand._robotErrTime = Date.now();
+      console.error('[Robot] 键鼠模块不可用，命令被忽略:', command);
+      notifyCaptureStatus({ ok: false, reason: 'robot-unavailable', message: '键鼠控制模块加载失败（PowerShell），无法执行鼠标键盘操作' });
+    }
+    return;
+  }
+  // 首次使用时确保初始化完成并同步屏幕尺寸
+  if (!r.isReady()) {
+    await r.init().catch(() => {});
+    await r.updateScreenSize().catch(() => {});
+  }
   try {
     switch (command) {
       case 'mouse-move':   await r.moveMouse(params.x || 0, params.y || 0); break;
@@ -1097,7 +1288,16 @@ function validateWsUrl(url) {
 
 // ==================== Electron 生命周期 ====================
 app.whenReady().then(async () => {
-  getWinRobot();
+  // 初始化配置路径（必须在 app ready 后）
+  CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+  logCrash('APP ready, CONFIG_PATH=' + CONFIG_PATH);
+
+  try {
+    getWinRobot();
+    logCrash('win-robot 加载完成');
+  } catch (e) {
+    logCrash('win-robot 加载异常: ' + e.message);
+  }
 
   const savedUrl = getSavedWsUrl();
   if (!savedUrl) {

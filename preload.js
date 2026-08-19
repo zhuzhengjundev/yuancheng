@@ -83,5 +83,25 @@ contextBridge.exposeInMainWorld('remoteAPI', {
     const h = () => callback();
     ipcRenderer.on('session-ended', h);
     return () => ipcRenderer.removeListener('session-ended', h);
+  },
+
+  // ============ 诊断（全链路排查用） ============
+  // 主控端：主进程收到的帧统计
+  onDiagStats: (callback) => {
+    const h = (_e, d) => callback(d);
+    ipcRenderer.on('diag-stats', h);
+    return () => ipcRenderer.removeListener('diag-stats', h);
+  },
+  // 被控端：捕获统计（帧数/失败数）
+  onCaptureStats: (callback) => {
+    const h = (_e, d) => callback(d);
+    ipcRenderer.on('capture-stats', h);
+    return () => ipcRenderer.removeListener('capture-stats', h);
+  },
+  // 被控端：键鼠模块状态
+  onRobotStatus: (callback) => {
+    const h = (_e, d) => callback(d);
+    ipcRenderer.on('robot-status', h);
+    return () => ipcRenderer.removeListener('robot-status', h);
   }
 });

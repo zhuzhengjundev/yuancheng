@@ -94,7 +94,7 @@ public class WinRobot {
             case "-": case "_": return 0xBD;
             case ".": case ">": return 0xBE;
             case "/": case "?": return 0xBF;
-            case "`": case "~": return 0xC0;
+            case "\`": case "~": return 0xC0;
             case "[": case "{": return 0xDB;
             case "\\": case "|": return 0xDC;
             case "]": case "}": return 0xDD;

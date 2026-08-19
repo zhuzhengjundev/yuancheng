@@ -389,6 +389,12 @@
         </button>
       </div>
 
+      <!-- 被控诊断：推流 + 键鼠状态（实时） -->
+      <div id="diagPanel" style="margin-top:10px;padding:14px;background:#eff6ff;border:1px solid #3b82f6;border-radius:12px;font-size:13px;line-height:1.6;display:block;">
+        <div style="font-weight:700;margin-bottom:6px;color:#2563eb;">控制中诊断</div>
+        <div id="diagText" style="color:#1e40af;">未在控制会话中</div>
+      </div>
+
       <button class="btn btn-danger" id="btnDisconnect" style="display:none;">断开连接</button>
     </div>
 
@@ -633,6 +639,75 @@
       $('btnConnect').textContent = '连接远程设备';
       toast('会话已结束');
     });
+
+    // ============ 被控端实时诊断 ============
+    const diagData = { capture: null, robot: null };
+    let captureLoggedError = '';
+    let robotLoggedError = '';
+    let robotReadyLogged = false;
+    function renderDiag() {
+      const el = $('diagText');
+      if (!el) return;
+      const c = diagData.capture, r = diagData.robot;
+      if (!c && !r) { el.textContent = '未在控制会话中'; return; }
+      const parts = [];
+      if (c) {
+        if (c.running) {
+          if (c.frames > 0) {
+            parts.push(`推流: ✅已发${c.frames}帧 ${c.lastSizeKB}KB/帧`);
+          } else {
+            parts.push(`推流: ⏳0帧`);
+          }
+          if (c.fails > 0) {
+            parts.push(`失败${c.fails}次`);
+          }
+          if (c.error) {
+            parts.push(`原因: ${c.error}`);
+          }
+        } else {
+          parts.push('推流: ❌未启动');
+        }
+      }
+      if (r) {
+        if (r.loaded) {
+          parts.push(`键鼠: ✅已加载 (${r.ready ? '就绪' : '初始化中'})`);
+        } else {
+          parts.push(`键鼠: ❌加载失败`);
+          if (r.error) parts.push(`错误: ${r.error}`);
+        }
+        parts.push(`收到命令${r.cmds}条`);
+      }
+      el.innerHTML = parts.map(p => `<div>${p}</div>`).join('');
+    }
+    if (api.onCaptureStats) {
+      api.onCaptureStats((c) => {
+        diagData.capture = c;
+        renderDiag();
+        if (c.error && (!captureLoggedError || captureLoggedError !== c.error)) {
+          captureLoggedError = c.error;
+          console.log('[被控诊断] 推流错误:', c.error);
+        }
+        if (!c.running) {
+          console.log('[被控诊断] 推流未启动');
+        } else if (c.frames > 0) {
+          if (c.frames % 10 === 0) console.log(`[被控诊断] 已发${c.frames}帧 ${c.lastSizeKB}KB/帧`);
+        }
+      });
+    }
+    if (api.onRobotStatus) {
+      api.onRobotStatus((r) => {
+        diagData.robot = r;
+        renderDiag();
+        if (!r.loaded && r.error && r.error !== robotLoggedError) {
+          robotLoggedError = r.error;
+          console.log('[被控诊断] 键鼠加载失败:', r.error);
+        }
+        if (r.loaded && !robotReadyLogged) {
+          robotReadyLogged = true;
+          console.log('[被控诊断] 键鼠模块已就绪');
+        }
+      });
+    }
 
     // ============ 初始化 ============
     (async function init() {
