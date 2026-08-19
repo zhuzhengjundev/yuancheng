@@ -183,7 +183,7 @@ setInterval(() => {
 
 // 屏幕捕获
 let captureTimer = null;
-const CAPTURE_INTERVAL = 150;
+const CAPTURE_INTERVAL = 33; // 30 FPS
 let captureFrameCount = 0;
 let captureFailCount = 0;
 
@@ -428,51 +428,7 @@ function sendToServer(data) {
   
   try {
     const json = JSON.stringify(data);
-    
-    // 小消息直接发送
-    if (json.length <= WS_MAX_CHUNK) {
-      ws.send(json);
-      return true;
-    }
-    
-    // 大消息分块发送
-    const msgId = ++wsChunkCounter;
-    const totalChunks = Math.ceil(json.length / WS_MAX_CHUNK);
-    const originalType = data.type || 'unknown';
-    
-    // 发送起始标记
-    ws.send(JSON.stringify({
-      __chunked: true,
-      phase: 'start',
-      msgId,
-      totalChunks,
-      originalType
-    }));
-    
-    // 发送数据块
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * WS_MAX_CHUNK;
-      const end = Math.min(start + WS_MAX_CHUNK, json.length);
-      ws.send(JSON.stringify({
-        __chunked: true,
-        phase: 'data',
-        msgId,
-        chunkIndex: i,
-        data: json.substring(start, end)
-      }));
-    }
-    
-    // 发送结束标记
-    ws.send(JSON.stringify({
-      __chunked: true,
-      phase: 'end',
-      msgId
-    }));
-    
-    if (!sendToServer._chunkLog || Date.now() - sendToServer._chunkLog >= 5000) {
-      console.log(`[WS] 分块发送: ${originalType}, ${totalChunks}块, 总${(json.length/1024).toFixed(1)}KB`);
-      sendToServer._chunkLog = Date.now();
-    }
+    ws.send(json);
     return true;
   } catch (e) {
     console.error('[WS] sendToServer 错误:', e.message);
@@ -735,43 +691,19 @@ function handlePeerMessage(payload, fromRole) {
       
       const imageData = payload.image;
 
-      // ====== 全部走分块 IPC 传输 ======
-      // 完整大帧经 webContents.send 会被 Electron 静默截断，
-      // 因此不分帧大小，统一拆成 8KB 块发送，由渲染进程重组
-      const CHUNK_SIZE = 8192; // 每块 8KB
-      const totalChunks = Math.ceil(imageData.length / CHUNK_SIZE);
-      const frameId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-
-      // 先发送帧头信息（包含实际屏幕分辨率）
-      controlWindow.webContents.send('screen-frame-header', {
-        frameId,
+      // ====== 整帧 IPC 传输 ======
+      // 直接将完整帧发送到控制窗口
+      controlWindow.webContents.send('screen-frame', {
+        image: imageData,
         width: payload.width,
         height: payload.height,
         screenWidth: payload.screenWidth || payload.width,
-        screenHeight: payload.screenHeight || payload.height,
-        totalChunks,
-        imageSize: imageData.length
+        screenHeight: payload.screenHeight || payload.height
       });
-
-      // 分块发送
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, imageData.length);
-        const chunk = imageData.substring(start, end);
-
-        controlWindow.webContents.send('screen-frame-chunk', {
-          frameId,
-          chunkIndex: i,
-          totalChunks,
-          data: chunk
-        });
-      }
       
-      // 主控端链路诊断统计（推送给控制窗口调试面板）
+      // 主控端链路诊断统计
       diagStats.framesReceived++;
       diagStats.framesSizeKB = (imageData.length * 3 / 4 / 1024).toFixed(1);
-      diagStats.headersSent++;
-      diagStats.chunksSent += totalChunks;
       diagStats.lastFrameTime = Date.now();
 
       // 每5秒打印一次状态
@@ -953,26 +885,31 @@ function startScreenCapture() {
       const thumb = src.thumbnail;
       // 获取尺寸（兼容 Texture 和 NativeImage）
       const thumbSz = thumb.getSize ? thumb.getSize() : { width: thumb.getWidth(), height: thumb.getHeight() };
-      // 使用高JPEG质量以保证清晰度
-      const jpeg = thumb.toJPEG(80);
-      if (!jpeg || jpeg.length === 0) {
-        captureFailed('empty-jpeg', `toJPEG 返回空 buffer`);
+      // 使用 PNG（无压缩，保留原始质量）
+      const png = thumb.toPNG();
+      if (!png || png.length === 0) {
+        captureFailed('empty-jpeg', `toPNG 返回空 buffer`);
         return;
       }
       // 成功捕获，清除错误
       lastCaptureError = '';
       captureFailCount = 0;
-      const base64 = jpeg.toString('base64');
+      const base64 = png.toString('base64');
       const sizeKB = (base64.length * 3 / 4 / 1024).toFixed(1);
       logCrash(`[Capture] 捕获成功: ${sizeKB}KB ${thumbSz.width}x${thumbSz.height}`);
         
-        // 检查帧大小 - 如果太大则跳过
-        const MAX_FRAME_SIZE = 500 * 1024; // 500KB
-        if (base64.length > MAX_FRAME_SIZE * 4 / 3) {
+        // 检查帧大小 - 超过 2MB 则记录警告
+        const MAX_FRAME_SIZE = 2048 * 1024; // 2MB
+        if (base64.length > MAX_FRAME_SIZE) {
           console.warn(`[Capture] 帧过大: ${sizeKB}KB, 可能导致传输问题`);
         }
         
         // 发送屏幕帧（包含实际屏幕分辨率用于坐标映射）
+        // 发送前检查 session 是否还有效
+        if (!sessionId || myRole !== 'controlled') {
+          logCrash('[Capture] 发送前检查: session已失效，跳过');
+          return;
+        }
         const sent = sendToPeer({
           type: 'screen-frame',
           image: base64,

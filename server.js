@@ -509,58 +509,13 @@ wss.on('connection', (ws, req) => {
           // 序列化并检查大小
           const serialized = JSON.stringify(forwardMsg);
           const msgSizeKB = Math.round(serialized.length / 1024);
-          const MAX_CHUNK = 12 * 1024; // 12KB 每块
           
-          // 转发时也分块（避免隧道截断）
-          const forwardChunk = (wsConn, jsonStr) => {
-            if (jsonStr.length <= MAX_CHUNK) {
-              wsConn.send(jsonStr);
-              return { chunks: 1, size: jsonStr.length };
-            }
-            
-            const fwdMsgId = Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-            const totalChunks = Math.ceil(jsonStr.length / MAX_CHUNK);
-            
-            // 发送起始标记
-            wsConn.send(JSON.stringify({
-              __server_chunked: true,
-              phase: 'start',
-              msgId: fwdMsgId,
-              totalChunks,
-              originalType: payloadType
-            }));
-            
-            // 发送数据块
-            for (let i = 0; i < totalChunks; i++) {
-              const start = i * MAX_CHUNK;
-              const end = Math.min(start + MAX_CHUNK, jsonStr.length);
-              wsConn.send(JSON.stringify({
-                __server_chunked: true,
-                phase: 'data',
-                msgId: fwdMsgId,
-                chunkIndex: i,
-                data: jsonStr.substring(start, end)
-              }));
-            }
-            
-            // 发送结束标记
-            wsConn.send(JSON.stringify({
-              __server_chunked: true,
-              phase: 'end',
-              msgId: fwdMsgId
-            }));
-            
-            return { chunks: totalChunks, size: jsonStr.length };
-          };
-          
-          // 执行转发
+          // 直接转发整帧（不分块）
           try {
-            const result = forwardChunk(peer.ws, serialized);
+            peer.ws.send(serialized);
             
-            // 打印转发状态
-            const logPrefix = result.chunks > 1 ? `分块${result.chunks}块` : '直传';
             if (!wss._forwardLogTime || Date.now() - wss._forwardLogTime >= 5000) {
-              console.log(`[SVR] 转发(${logPrefix}): type=${payloadType}, size=${msgSizeKB}KB, 到=${formatCode(peerCode)}`);
+              console.log(`[SVR] 转发: type=${payloadType}, size=${msgSizeKB}KB, 到=${formatCode(peerCode)}`);
               wss._forwardLogTime = Date.now();
             }
           } catch (sendErr) {
