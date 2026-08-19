@@ -264,6 +264,45 @@
       z-index: 999;
     }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ========== 屏幕录制权限警告 ========== */
+    .capture-warn {
+      margin-top: 10px;
+      padding: 14px;
+      background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+      border: 1px solid #f59e0b;
+      border-radius: 12px;
+      font-size: 13px;
+      color: #92400e;
+      line-height: 1.6;
+      display: none;
+    }
+    .capture-warn.show { display: block; }
+    .capture-warn .warn-title {
+      font-weight: 700;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .capture-warn .warn-title svg { width: 16px; height: 16px; }
+    .capture-warn .warn-msg { margin-bottom: 10px; }
+    .capture-warn .warn-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #f59e0b;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .capture-warn .warn-btn:hover { background: #d97706; }
+    .capture-warn .warn-btn svg { width: 14px; height: 14px; }
   </style>
 </head>
 <body>
@@ -328,6 +367,26 @@
       </div>
       <div class="session-tip controlled" id="sessControlled">
         ⚠️ 对方设备（<span id="peerCodeB"></span>）正在控制本机<br>您可以随时点击下方"断开连接"终止会话。
+      </div>
+
+      <!-- 屏幕录制权限警告 -->
+      <div class="capture-warn" id="captureWarn">
+        <div class="warn-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          屏幕录制权限未开启
+        </div>
+        <div class="warn-msg" id="captureWarnMsg">无法捕获屏幕画面，远程控制对方将无法看到您的屏幕。请在系统设置中授予屏幕录制权限。</div>
+        <button class="warn-btn" id="btnFixCapture">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          打开系统设置
+        </button>
       </div>
 
       <button class="btn btn-danger" id="btnDisconnect" style="display:none;">断开连接</button>
@@ -552,6 +611,22 @@
     api.onIncomingControl((r) => {
       toast(`设备 ${fmtCode(r.peerCode)} 正在控制本机`);
     });
+    api.onCaptureStatus((s) => {
+      const warn = $('captureWarn');
+      const msg = $('captureWarnMsg');
+      if (!s.ok) {
+        msg.textContent = s.message || '屏幕捕获失败，请检查屏幕录制权限';
+        warn.classList.add('show');
+      } else {
+        warn.classList.remove('show');
+      }
+    });
+    $('btnFixCapture').onclick = () => {
+      if (api.openScreenRecordSettings) {
+        api.openScreenRecordSettings();
+        toast('已打开系统设置，请开启屏幕录制权限');
+      }
+    };
     api.onSessionEnded(() => {
       renderSession(null);
       $('btnConnect').disabled = false;

@@ -11,7 +11,7 @@
  *   - 被控端：开始推屏幕，收到命令后通过 win-robot 执行
  */
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, screen, clipboard, systemPreferences, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -335,6 +335,8 @@ function handleServerMessage(data) {
 
 function cleanupSession(disconnected) {
   stopScreenCapture();
+  captureFailCount = 0;
+  captureWarningShown = false;
   if (controlWindow) {
     controlWindow.webContents.send('session-ended');
     // 主控端关闭窗口；被控端不关闭（它可能没打开）
@@ -403,9 +405,53 @@ function handlePeerMessage(payload, fromRole) {
 }
 
 // ==================== 屏幕捕获（被控端推流） ====================
+let captureFailCount = 0;
+let captureWarningShown = false;
+
+function checkScreenRecordPermission() {
+  // macOS: 检查屏幕录制权限
+  if (process.platform === 'darwin') {
+    try {
+      if (systemPreferences && systemPreferences.getMediaAccessStatus) {
+        const status = systemPreferences.getMediaAccessStatus('screen');
+        console.log('[Capture] 屏幕录制权限状态:', status);
+        return status === 'granted';
+      }
+    } catch (e) {
+      console.warn('[Capture] 无法检查权限状态:', e.message);
+    }
+  }
+  return true; // 非 macOS 默认允许
+}
+
+function openScreenRecordSettings() {
+  if (process.platform === 'darwin') {
+    // macOS 直接打开系统设置的屏幕录制页面
+    try {
+      shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+    } catch (e) {
+      console.warn('[Capture] 无法打开系统设置:', e.message);
+    }
+  }
+}
+
+function notifyCaptureStatus(status) {
+  if (mainWindow) {
+    mainWindow.webContents.send('capture-status', status);
+  }
+}
+
 function startScreenCapture() {
   if (captureTimer) return;
   console.log('[Capture] 开始屏幕捕获');
+
+  // 检查权限
+  const hasPermission = checkScreenRecordPermission();
+  if (!hasPermission) {
+    console.warn('[Capture] 屏幕录制权限未授予！');
+    notifyCaptureStatus({ ok: false, reason: 'no-permission', message: '屏幕录制权限未授予，请前往系统设置开启' });
+    captureWarningShown = true;
+  }
 
   const captureOnce = async () => {
     if (!sessionId || myRole !== 'controlled') {
@@ -425,6 +471,7 @@ function startScreenCapture() {
       });
 
       if (sources.length > 0) {
+        captureFailCount = 0;
         const thumb = sources[0].thumbnail;
         const jpeg = thumb.toJPEG(65);
         sendToPeer({
@@ -433,9 +480,36 @@ function startScreenCapture() {
           width: thumb.getWidth(),
           height: thumb.getHeight()
         });
+        // 首次成功捕获，通知UI权限OK
+        if (captureWarningShown) {
+          notifyCaptureStatus({ ok: true });
+          captureWarningShown = false;
+        }
+      } else {
+        // 无可用屏幕源 - 可能是权限问题
+        captureFailCount++;
+        console.warn(`[Capture] 无屏幕源可用 (连续${captureFailCount}次)`);
+        if (captureFailCount >= 3 && !captureWarningShown) {
+          console.warn('[Capture] 检测到屏幕捕获失败，可能是权限问题');
+          notifyCaptureStatus({
+            ok: false,
+            reason: 'no-sources',
+            message: '无法捕获屏幕画面，请检查屏幕录制权限'
+          });
+          captureWarningShown = true;
+        }
       }
     } catch (e) {
+      captureFailCount++;
       console.error('[Capture] 错误:', e.message);
+      if (captureFailCount >= 3 && !captureWarningShown) {
+        notifyCaptureStatus({
+          ok: false,
+          reason: 'error',
+          message: '屏幕捕获出错: ' + e.message
+        });
+        captureWarningShown = true;
+      }
     }
   };
 
@@ -517,6 +591,14 @@ ipcMain.handle('connect-device', (_e, { targetCode, targetPassword }) => {
 ipcMain.handle('disconnect', () => {
   sendToServer({ type: 'disconnect' });
   cleanupSession(false);
+  captureFailCount = 0;
+  captureWarningShown = false;
+  return true;
+});
+
+// 打开屏幕录制权限设置（macOS）
+ipcMain.handle('open-screen-record-settings', () => {
+  openScreenRecordSettings();
   return true;
 });
 

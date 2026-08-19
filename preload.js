@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('remoteAPI', {
   connectDevice: (targetCode, targetPassword) =>
     ipcRenderer.invoke('connect-device', { targetCode, targetPassword }),
   disconnect: () => ipcRenderer.invoke('disconnect'),
+  openScreenRecordSettings: () => ipcRenderer.invoke('open-screen-record-settings'),
 
   // ============ WS 地址管理（setup.html + index.html） ============
   validateWsUrl: (url) => ipcRenderer.invoke('validate-ws-url', { url }),
@@ -44,6 +45,11 @@ contextBridge.exposeInMainWorld('remoteAPI', {
     const h = (_e, r) => callback(r);
     ipcRenderer.on('incoming-control', h);
     return () => ipcRenderer.removeListener('incoming-control', h);
+  },
+  onCaptureStatus: (callback) => {
+    const h = (_e, s) => callback(s);
+    ipcRenderer.on('capture-status', h);
+    return () => ipcRenderer.removeListener('capture-status', h);
   },
 
   // ============ 控制窗口（control.html） ============
